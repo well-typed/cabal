@@ -14,6 +14,7 @@ import Distribution.Client.Dependency.Modular.Message
 import Distribution.Client.Dependency.Modular.Package
 import qualified Distribution.Client.Dependency.Modular.Preference as P
 import Distribution.Client.Dependency.Modular.Validate
+import Distribution.Client.Dependency.Modular.Linking
 
 -- | Various options for the modular solver.
 data SolverConfig = SolverConfig {
@@ -43,12 +44,15 @@ solve sc idx userPrefs userConstraints userGoals =
     heuristicsPhase  = P.firstGoal . -- after doing goal-choice heuristics, commit to the first choice (saves space)
                        P.deferWeakFlagChoices .
                        P.preferBaseGoalChoice .
+                       P.preferLinked .
                        if preferEasyGoalChoices sc
                          then P.lpreferEasyGoalChoices
                          else id
     preferencesPhase = P.preferPackagePreferences userPrefs
     validationPhase  = P.enforceManualFlags . -- can only be done after user constraints
                        P.enforcePackageConstraints userConstraints .
+                       P.enforceSingleInstanceRestriction .
+                       validateLinking idx .
                        validateTree idx
     prunePhase       = (if avoidReinstalls sc then P.avoidReinstalls (const True) else id) .
                        -- packages that can never be "upgraded":
@@ -57,4 +61,4 @@ solve sc idx userPrefs userConstraints userGoals =
                                                   , PackageName "integer-gmp"
                                                   , PackageName "integer-simple"
                                                   ])
-    buildPhase       = buildTree idx (independentGoals sc) userGoals
+    buildPhase       = addLinking $ buildTree idx (independentGoals sc) userGoals
