@@ -48,7 +48,6 @@ import Data.Function (on)
 import Data.SBV
 
 import Debug.Trace (trace)
-import System.IO.Unsafe (unsafePerformIO)
 
 
 -- | symbolic package version
@@ -148,10 +147,11 @@ solveSMT targets pns nis dcs = do
 -- TODO: - use all package instances, not just source packages
 --       - make it adhere to all Cabal flags and constraints
 externalSMTResolver :: SolverConfig -> DependencyResolver
-externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns =
-  let sln  = unsafePerformIO $ solveSMT (S.fromList pns) allTargets nis dcs
-      sln' = toPackageIds vms $ filter ((/= 0) . snd) sln
-  in trace (show $ map prettyPackageId sln') $ Fail "not fully implemented yet"
+externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
+  sln <- solveSMT (S.fromList pns) allTargets nis dcs
+  let sln' = toPackageIds vms $ filter ((/= 0) . snd) sln
+  print $ map prettyPackageId sln'
+  return $ Fail "not fully implemented yet"
   where
     nis :: [SWord32]
     nis = map (fromIntegral . length . pkgVersions) allTargets

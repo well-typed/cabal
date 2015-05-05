@@ -115,6 +115,9 @@ instance Text PreSolver where
 -- solving the package dependency problem and we want to make it easy to swap
 -- in alternatives.
 --
+-- We allow IO to be used so that in principle, we can invoke an external
+-- solver.
+--
 type DependencyResolver = Platform
                        -> CompilerInfo
                        -> InstalledPackageIndex
@@ -122,7 +125,7 @@ type DependencyResolver = Platform
                        -> (PackageName -> PackagePreferences)
                        -> [PackageConstraint]
                        -> [PackageName]
-                       -> Progress String String [InstallPlan.PlanPackage]
+                       -> IO (Progress String String [InstallPlan.PlanPackage])
 
 -- | Per-package constraints. Package constraints must be respected by the
 -- solver. Multiple constraints for each package can be given, though obviously
