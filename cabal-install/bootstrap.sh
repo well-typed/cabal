@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/bin/sh
 
 # A script to bootstrap cabal-install.
 
@@ -51,43 +51,42 @@ GZIP_PROGRAM="${GZIP_PROGRAM:-gzip}"
 SCOPE_OF_INSTALLATION="${SCOPE_OF_INSTALLATION:---user}"
 DEFAULT_PREFIX="${HOME}/.cabal"
 
-# Try to respect $TMPDIR but override if needed - see #1710.
-[ -"$TMPDIR"- = -""- ] || echo "$TMPDIR" | grep -q ld &&
+# Try to respect $TMPDIR.
+[ -"$TMPDIR"- = -""- ] &&
   export TMPDIR=/tmp/cabal-$(echo $(od -XN4 -An /dev/random)) && mkdir $TMPDIR
 
-# Check for a C compiler.
-[ ! -x "$CC" ] && for ccc in gcc clang cc icc; do
-  ${ccc} --version > /dev/null 2>&1 && CC=$ccc &&
-  echo "Using $CC for C compiler. If this is not what you want, set CC." >&2 &&
+# Check for a C compiler, using user-set $CC, if any, first.
+for c in $CC gcc clang cc icc; do
+  $c --version 2>&1 >/dev/null && CC=$c &&
+  echo "Using $c for C compiler. If this is not what you want, set CC." >&2 &&
   break
 done
 
 # None found.
-[ ! -x `which "$CC"` ] &&
-  die "C compiler not found (or could not be run).
-       If a C compiler is installed make sure it is on your PATH,
-       or set the CC variable."
+[ -"$CC"- = -""- ] && die 'C compiler not found (or could not be run).
+  If a C compiler is installed make sure it is on your PATH, or set $CC.'
 
-# Check the C compiler/linker work.
+# Find the correct linker/linker-wrapper.
 LINK="$(for link in collect2 ld; do
-  echo 'main;' | ${CC} -v -x c - -o /dev/null -\#\#\# 2>&1 | grep -q $link &&
-  echo 'main;' | ${CC} -v -x c - -o /dev/null -\#\#\# 2>&1 | grep    $link |
-  sed -e "s|\(.*$link\).*|\1|" -e 's/ //g' -e 's|"||' && break
-done)"
+          [ $($CC -print-prog-name=$link) = $link ] && continue ||
+          $CC -print-prog-name=$link
+        done)"
 
-# They don't.
-[ -z "$LINK" ] &&
-  die "C compiler and linker could not compile a simple test program.
-       Please check your toolchain."
+# Fall back to "ld"... might work.
+[ -$LINK- = -""- ] && LINK=ld
 
-## Warn that were's overriding $LD if set (if you want).
+# And finally, see if we can compile and link something.
+  echo 'int main(){}' | $CC -xc - -o /dev/null ||
+    die "C compiler and linker could not compile a simple test program.
+    Please check your toolchain."
 
-[ -x "$LD" ] && [ "$LD" != "$LINK" ] &&
+# Warn that were's overriding $LD if set (if you want).
+[ -"$LD"- != -""- ] && [ -"$LD"- != -"$LINK"- ] &&
   echo "Warning: value set in $LD is not the same as C compiler's $LINK." >&2
   echo "Using $LINK instead." >&2
 
 # Set LD, overriding environment if necessary.
-LD=$LINK
+export LD=$LINK
 
 # Check we're in the right directory, etc.
 grep "cabal-install" ./cabal-install.cabal > /dev/null 2>&1 ||
@@ -178,17 +177,17 @@ PREFIX=${PREFIX:-${DEFAULT_PREFIX}}
 
 # Versions of the packages to install.
 # The version regex says what existing installed versions are ok.
-PARSEC_VER="3.1.8";    PARSEC_VER_REGEXP="[3]\.[01]\."
+PARSEC_VER="3.1.9";    PARSEC_VER_REGEXP="[3]\.[01]\."
                        # >= 3.0 && < 3.2
-DEEPSEQ_VER="1.4.0.0"; DEEPSEQ_VER_REGEXP="1\.[1-9]\."
+DEEPSEQ_VER="1.4.1.1"; DEEPSEQ_VER_REGEXP="1\.[1-9]\."
                        # >= 1.1 && < 2
 BINARY_VER="0.7.2.3";  BINARY_VER_REGEXP="[0]\.[7]\."
                        # == 0.7.*
-TEXT_VER="1.2.0.4";    TEXT_VER_REGEXP="((1\.[012]\.)|(0\.([2-9]|(1[0-1]))\.))"
+TEXT_VER="1.2.1.1";    TEXT_VER_REGEXP="((1\.[012]\.)|(0\.([2-9]|(1[0-1]))\.))"
                        # >= 0.2 && < 1.3
-NETWORK_VER="2.6.0.2"; NETWORK_VER_REGEXP="2\.[0-6]\."
+NETWORK_VER="2.6.2.0"; NETWORK_VER_REGEXP="2\.[0-6]\."
                        # >= 2.0 && < 2.7
-NETWORK_URI_VER="2.6.0.1"; NETWORK_URI_VER_REGEXP="2\.6\."
+NETWORK_URI_VER="2.6.0.3"; NETWORK_URI_VER_REGEXP="2\.6\."
                        # >= 2.6 && < 2.7
 CABAL_VER="1.23.0.0";  CABAL_VER_REGEXP="1\.23\."
                        # >= 1.23 && < 1.24

@@ -24,11 +24,9 @@ import Prelude hiding (lookup)
 import qualified Data.Map as Map
 import qualified Data.Tree  as Tree
 import qualified Data.Graph as Graph
-import qualified Data.Array as Array
 import Data.Array ((!))
-import Data.List (sortBy)
 import Data.Map (Map)
-import Data.Maybe (isNothing, fromMaybe)
+import Data.Maybe (isNothing, fromMaybe, fromJust)
 import Data.Either (lefts)
 
 #if !MIN_VERSION_base(4,8,0)
@@ -41,9 +39,9 @@ import Distribution.Package
          )
 import Distribution.Version
          ( Version )
-import Distribution.Simple.Utils
-         ( comparing )
 
+import Distribution.Client.ComponentDeps (ComponentDeps)
+import qualified Distribution.Client.ComponentDeps as CD
 import Distribution.Client.PackageIndex
          ( PackageFixedDeps(..) )
 import Distribution.Simple.PackageIndex
@@ -88,8 +86,8 @@ type FakeMap = Map InstalledPackageId InstalledPackageId
 -- | Variant of `depends` which accepts a `FakeMap`
 --
 -- Analogous to `fakeInstalledDepends`. See Note [FakeMap].
-fakeDepends :: PackageFixedDeps pkg => FakeMap -> pkg -> [InstalledPackageId]
-fakeDepends fakeMap = map resolveFakeId . depends
+fakeDepends :: PackageFixedDeps pkg => FakeMap -> pkg -> ComponentDeps [InstalledPackageId]
+fakeDepends fakeMap = fmap (map resolveFakeId) . depends
   where
     resolveFakeId :: InstalledPackageId -> InstalledPackageId
     resolveFakeId ipid = Map.findWithDefault ipid ipid fakeMap
@@ -113,11 +111,17 @@ brokenPackages fakeMap index =
   [ (pkg, missing)
   | pkg  <- allPackages index
   , let missing =
-          [ pkg' | pkg' <- depends pkg
+          [ pkg' | pkg' <- CD.nonSetupDeps (depends pkg)
                  , isNothing (fakeLookupInstalledPackageId fakeMap index pkg') ]
   , not (null missing) ]
 
-
+-- | Compute all roots of the install plan, and verify that the transitive
+-- plans from those roots are all consistent.
+--
+-- NOTE: This does not check for dependency cycles. Moreover, dependency cycles
+-- may be absent from the subplans even if the larger plan contains a dependency
+-- cycle. Such cycles may or may not be an issue; either way, we don't check
+-- for them here.
 dependencyInconsistencies :: forall pkg. (PackageFixedDeps pkg, HasInstalledPackageId pkg)
                           => FakeMap
                           -> Bool
@@ -141,6 +145,7 @@ rootSets :: (PackageFixedDeps pkg, HasInstalledPackageId pkg)
          => FakeMap -> Bool -> PackageIndex pkg -> [[InstalledPackageId]]
 rootSets fakeMap indepGoals index =
        if indepGoals then map (:[]) libRoots else [libRoots]
+    ++ setupRoots index
   where
     libRoots = libraryRoots fakeMap index
 
@@ -157,6 +162,12 @@ libraryRoots fakeMap index =
     indegree = Graph.indegree graph
     roots    = filter isRoot (Graph.vertices graph)
     isRoot v = indegree ! v == 0
+
+-- | The setup dependencies of each package in the plan
+setupRoots :: PackageFixedDeps pkg => PackageIndex pkg -> [[InstalledPackageId]]
+setupRoots = filter (not . null)
+           . map (CD.setupDeps . depends)
+           . allPackages
 
 -- | Given a package index where we assume we want to use all the packages
 -- (use 'dependencyClosure' if you need to get such a index subset) find out
@@ -190,7 +201,7 @@ dependencyInconsistencies' fakeMap index =
       | -- For each package @pkg@
         pkg <- allPackages index
         -- Find out which @ipid@ @pkg@ depends on
-      , ipid <- fakeDepends fakeMap pkg
+      , ipid <- CD.nonSetupDeps (fakeDepends fakeMap pkg)
         -- And look up those @ipid@ (i.e., @ipid@ is the ID of @dep@)
       , Just dep <- [fakeLookupInstalledPackageId fakeMap index ipid]
       ]
@@ -206,8 +217,8 @@ dependencyInconsistencies' fakeMap index =
     reallyIsInconsistent [p1, p2] =
       let pid1 = installedPackageId p1
           pid2 = installedPackageId p2
-      in Map.findWithDefault pid1 pid1 fakeMap `notElem` fakeDepends fakeMap p2
-      && Map.findWithDefault pid2 pid2 fakeMap `notElem` fakeDepends fakeMap p1
+      in Map.findWithDefault pid1 pid1 fakeMap `notElem` CD.nonSetupDeps (fakeDepends fakeMap p2)
+      && Map.findWithDefault pid2 pid2 fakeMap `notElem` CD.nonSetupDeps (fakeDepends fakeMap p1)
     reallyIsInconsistent _ = True
 
 
@@ -227,7 +238,7 @@ dependencyCycles :: (PackageFixedDeps pkg, HasInstalledPackageId pkg)
 dependencyCycles fakeMap index =
   [ vs | Graph.CyclicSCC vs <- Graph.stronglyConnComp adjacencyList ]
   where
-    adjacencyList = [ (pkg, installedPackageId pkg, fakeDepends fakeMap pkg)
+    adjacencyList = [ (pkg, installedPackageId pkg, CD.nonSetupDeps (fakeDepends fakeMap pkg))
                     | pkg <- allPackages index ]
 
 
@@ -258,7 +269,7 @@ dependencyClosure fakeMap index pkgids0 = case closure mempty [] pkgids0 of
             Just _  -> closure completed  failed pkgids
             Nothing -> closure completed' failed pkgids'
               where completed' = insert pkg completed
-                    pkgids'    = depends pkg ++ pkgids
+                    pkgids'    = CD.nonSetupDeps (depends pkg) ++ pkgids
 
 
 topologicalOrder :: (PackageFixedDeps pkg, HasInstalledPackageId pkg)
@@ -313,19 +324,16 @@ dependencyGraph :: (PackageFixedDeps pkg, HasInstalledPackageId pkg)
                     InstalledPackageId -> Maybe Graph.Vertex)
 dependencyGraph fakeMap index = (graph, vertexToPkg, idToVertex)
   where
-    graph = Array.listArray bounds
-              [ [ v | Just v <- map idToVertex (depends pkg) ]
-              | pkg <- pkgs ]
+    (graph, vertexToPkg', idToVertex) = Graph.graphFromEdges edges
+    vertexToPkg = fromJust
+                . (\((), key, _targets) -> lookupInstalledPackageId index key)
+                . vertexToPkg'
 
-    pkgs      = sortBy (comparing packageId) (allPackages index)
-    pkgTable  = Array.listArray bounds pkgs
-    bounds    = (0, topBound)
-    topBound  = length pkgs - 1
-    vertexToPkg vertex = pkgTable ! vertex
+    pkgs  = allPackages index
+    edges = map edgesFrom pkgs
 
-    -- Old implementation used to use an array for vertices as well, with a
-    -- binary search algorithm. Not sure why this changed, but sticking with
-    -- this linear search for now.
-    vertices  = zip (map installedPackageId pkgs) [0..]
-    vertexMap = Map.fromList vertices
-    idToVertex pid = Map.lookup (Map.findWithDefault pid pid fakeMap) vertexMap
+    resolve   pid = Map.findWithDefault pid pid fakeMap
+    edgesFrom pkg = ( ()
+                    , resolve (installedPackageId pkg)
+                    , CD.nonSetupDeps (fakeDepends fakeMap pkg)
+                    )

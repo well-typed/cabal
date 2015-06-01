@@ -17,12 +17,14 @@ import Network.HTTP.Proxy ( Proxy(..), fetchProxy)
 import Network.URI
          ( URI (..), URIAuth (..) )
 import Network.Browser
-         ( BrowserAction, browse
-         , setOutHandler, setErrHandler, setProxy, setAuthorityGen, request)
+         ( BrowserAction, browse, setAllowBasicAuth, setAuthorityGen
+         , setOutHandler, setErrHandler, setProxy, request)
 import Network.Stream
          ( Result, ConnError(..) )
+import Control.Exception
+         ( handleJust )
 import Control.Monad
-         ( liftM )
+         ( liftM, guard )
 import qualified Data.ByteString.Lazy.Char8 as ByteString
 import Data.ByteString.Lazy (ByteString)
 
@@ -42,6 +44,8 @@ import System.FilePath
          ( (<.>) )
 import System.Directory
          ( doesFileExist )
+import System.IO.Error
+         ( isDoesNotExistError )
 
 data DownloadResult = FileAlreadyInCache | FileDownloaded FilePath deriving (Eq)
 
@@ -80,21 +84,25 @@ getHTTP :: Verbosity
         -> Maybe String -- ^ Optional etag to check if we already have the latest file.
         -> IO (Result (Response ByteString))
 getHTTP verbosity uri etag = liftM (\(_, resp) -> Right resp) $
-                                   cabalBrowse verbosity (return ()) (request (mkRequest uri etag))
+                                   cabalBrowse verbosity Nothing (request (mkRequest uri etag))
 
 cabalBrowse :: Verbosity
-            -> BrowserAction s ()
+            -> Maybe (String, String)
             -> BrowserAction s a
             -> IO a
 cabalBrowse verbosity auth act = do
     p   <- proxy verbosity
-    browse $ do
-        setProxy p
-        setErrHandler (warn verbosity . ("http error: "++))
-        setOutHandler (debug verbosity)
-        auth
-        setAuthorityGen (\_ _ -> return Nothing)
-        act
+    handleJust
+        (guard . isDoesNotExistError)
+        (const . die $ "Couldn't establish HTTP connection. "
+                    ++ "Possible cause: HTTP proxy server is down.") $
+        browse $ do
+            setProxy p
+            setErrHandler (warn verbosity . ("http error: "++))
+            setOutHandler (debug verbosity)
+            setAllowBasicAuth False
+            setAuthorityGen (\_ _ -> return auth)
+            act
 
 downloadURI :: Verbosity
             -> URI      -- ^ What to download

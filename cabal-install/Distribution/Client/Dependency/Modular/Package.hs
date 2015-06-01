@@ -67,15 +67,35 @@ instI (I _ (Inst _)) = True
 instI _              = False
 
 -- | Package path.
-data PP = Independent Int PP | Setup PN PP | None
+--
+-- Stored in reverse order
+data PP =
+    -- User-specified independent goal
+    Independent Int PP
+    -- Setup dependencies are always considered independent from their package
+  | Setup PN PP
+    -- Any dependency on base is considered independent (allows for base shims)
+  | Base PN PP
+    -- Unqualified
+  | None
   deriving (Eq, Ord, Show)
+
+-- | Strip any 'Base' qualifiers from a PP
+--
+-- (the Base qualifier does not get inherited)
+stripBase :: PP -> PP
+stripBase (Independent i pp) = Independent i (stripBase pp)
+stripBase (Setup pn      pp) = Setup pn      (stripBase pp)
+stripBase (Base _pn      pp) =                stripBase pp
+stripBase None               = None
 
 -- | String representation of a package path.
 --
 -- NOTE: This always ends in a period
 showPP :: PP -> String
-showPP (Independent i pp) = show i ++ "." ++ showPP pp
-showPP (Setup pn      pp) = display pn ++ ".setup." ++ showPP pp
+showPP (Independent i pp) = show i                 ++ "." ++ showPP pp
+showPP (Setup pn      pp) = display pn ++ "-setup" ++ "." ++ showPP pp
+showPP (Base  pn      pp) = display pn             ++ "." ++ showPP pp
 showPP None               = ""
 
 -- | A qualified entity. Pairs a package path with the entity.
@@ -100,7 +120,6 @@ makeIndependent :: [PN] -> [QPN]
 makeIndependent ps = [ Q pp pn | (pn, i) <- zip ps [0::Int ..]
                                , let pp = Independent i None
                      ]
-
 
 unQualify :: Q a -> a
 unQualify (Q _ x) = x

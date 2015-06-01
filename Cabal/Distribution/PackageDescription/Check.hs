@@ -55,7 +55,7 @@ import Distribution.License
 import Distribution.Simple.CCompiler
          ( filenameCDialect )
 import Distribution.Simple.Utils
-         ( cabalVersion, intercalate, parseFileGlob, FileGlob(..), lowercase )
+         ( cabalVersion, intercalate, parseFileGlob, FileGlob(..), lowercase, startsWithBOM, fromUTF8 )
 
 import Distribution.Version
          ( Version(..)
@@ -77,9 +77,11 @@ import qualified Language.Haskell.Extension as Extension (deprecatedExtensions)
 import Language.Haskell.Extension
          ( Language(UnknownLanguage), knownLanguages
          , Extension(..), KnownExtension(..) )
+import qualified System.Directory (getDirectoryContents)
+import System.IO (openBinaryFile, IOMode(ReadMode), hGetContents)
 import System.FilePath
          ( (</>), takeExtension, isRelative, isAbsolute
-         , splitDirectories,  splitPath )
+         , splitDirectories,  splitPath, splitExtension )
 import System.FilePath.Windows as FilePath.Windows
          ( isValid )
 
@@ -132,7 +134,6 @@ checkSpecVersion pkg specver cond pc
   | specVersion pkg >= Version specver [] = Nothing
   | otherwise                             = check cond pc
 
-
 -- ------------------------------------------------------------
 -- * Standard checks
 -- ------------------------------------------------------------
@@ -154,6 +155,7 @@ checkPackage gpkg mpkg =
      checkConfiguredPackage pkg
   ++ checkConditionals gpkg
   ++ checkPackageVersions gpkg
+  ++ checkDevelopmentOnlyFlags gpkg
   where
     pkg = fromMaybe (flattenPackageDescription gpkg) mpkg
 
@@ -411,6 +413,12 @@ checkFields pkg =
           ++ commaSep (map display knownBuildTypes)
       _ -> Nothing
 
+  , check (isJust (setupBuildInfo pkg) && buildType pkg /= Just Custom) $
+      PackageBuildWarning $
+           "Ignoring the 'custom-setup' section because the 'build-type' is "
+        ++ "not 'Custom'. Use 'build-type: Custom' if you need to use a "
+        ++ "custom Setup.hs script."
+
   , check (not (null unknownCompilers)) $
       PackageBuildWarning $
         "Unknown compiler " ++ commaSep (map quote unknownCompilers)
@@ -592,19 +600,7 @@ checkGhcOptions :: PackageDescription -> [PackageCheck]
 checkGhcOptions pkg =
   catMaybes [
 
-    check has_WerrorWall $
-      PackageDistInexcusable $
-           "'ghc-options: -Wall -Werror' makes the package very easy to "
-        ++ "break with future GHC versions because new GHC versions often "
-        ++ "add new warnings. Use just 'ghc-options: -Wall' instead."
-
-  , check (not has_WerrorWall && has_Werror) $
-      PackageDistSuspicious $
-           "'ghc-options: -Werror' makes the package easy to "
-        ++ "break with future GHC versions because new GHC versions often "
-        ++ "add new warnings."
-
-  , checkFlags ["-fasm"] $
+    checkFlags ["-fasm"] $
       PackageDistInexcusable $
            "'ghc-options: -fasm' is unnecessary and will not work on CPU "
         ++ "architectures other than x86, x86-64, ppc or sparc."
@@ -616,21 +612,10 @@ checkGhcOptions pkg =
         ++ "is using the FFI incorrectly and will probably not work with GHC "
         ++ "6.10 or later."
 
-  , checkFlags ["-fdefer-type-errors"] $
-      PackageDistInexcusable $
-          "'ghc-options: -fdefer-type-errors' is fine during development but "
-       ++ "is not appropriate for a distributed package."
-
   , checkFlags ["-fhpc"] $
       PackageDistInexcusable $
-        "'ghc-options: -fhpc' is not appropriate for a distributed package."
-
-    -- -dynamic is not a debug flag
-  , check (any (\opt -> "-d" `isPrefixOf` opt && opt /= "-dynamic")
-           all_ghc_options) $
-      PackageDistInexcusable $
-        "'ghc-options: -d*' debug flags are not appropriate "
-        ++ "for a distributed package."
+           "'ghc-options: -fhpc' is not not necessary. Use the configure flag "
+        ++ " --enable-coverage instead."
 
   , checkFlags ["-prof"] $
       PackageBuildWarning $
@@ -691,20 +676,20 @@ checkGhcOptions pkg =
         "Instead of 'ghc-options: -fglasgow-exts' it is preferable to use "
         ++ "the 'extensions' field."
 
-  , checkProfFlags ["-auto-all"] $
-      PackageDistSuspicious $
-        "'ghc-prof-options: -auto-all' is fine during development, but "
-        ++ "not recommended in a distributed package. "
-
-  , checkProfFlags ["-fprof-auto"] $
-      PackageDistSuspicious $
-        "'ghc-prof-options: -fprof-auto' is fine during development, but "
-        ++ "not recommended in a distributed package. "
-
   , check ("-threaded" `elem` lib_ghc_options) $
-      PackageDistSuspicious $
+      PackageBuildWarning $
            "'ghc-options: -threaded' has no effect for libraries. It should "
         ++ "only be used for executables."
+
+  , check ("-rtsopts" `elem` lib_ghc_options) $
+      PackageBuildWarning $
+           "'ghc-options: -rtsopts' has no effect for libraries. It should "
+        ++ "only be used for executables."
+
+  , check (any (\opt -> "-with-rtsopts" `isPrefixOf` opt) lib_ghc_options) $
+      PackageBuildWarning $
+           "'ghc-options: -with-rtsopts' has no effect for libraries. It "
+        ++ "should only be used for executables."
 
   , checkAlternatives "ghc-options" "extensions"
       [ (flag, display extension) | flag <- all_ghc_options
@@ -728,23 +713,12 @@ checkGhcOptions pkg =
   ]
 
   where
-    has_WerrorWall = flip any ghc_options $ \opts ->
-                               "-Werror" `elem` opts
-                           && ("-Wall"   `elem` opts || "-W" `elem` opts)
-    has_Werror     = any (\opts -> "-Werror" `elem` opts) ghc_options
+    all_ghc_options    = concatMap get_ghc_options (allBuildInfo pkg)
+    lib_ghc_options    = maybe [] (get_ghc_options . libBuildInfo) (library pkg)
+    get_ghc_options bi = hcOptions GHC bi ++ hcProfOptions GHC bi
 
-    (ghc_options, ghc_prof_options) =
-      unzip . map (\bi -> (hcOptions GHC bi, hcProfOptions GHC bi))
-      $ (allBuildInfo pkg)
-    all_ghc_options      = concat ghc_options
-    all_ghc_prof_options = concat ghc_prof_options
-    lib_ghc_options = maybe [] (hcOptions GHC . libBuildInfo) (library pkg)
-
-    checkFlags,checkProfFlags :: [String] -> PackageCheck -> Maybe PackageCheck
-    checkFlags     flags = doCheckFlags flags all_ghc_options
-    checkProfFlags flags = doCheckFlags flags all_ghc_prof_options
-
-    doCheckFlags   flags opts = check (any (`elem` flags) opts)
+    checkFlags :: [String] -> PackageCheck -> Maybe PackageCheck
+    checkFlags flags = check (any (`elem` flags) all_ghc_options)
 
     ghcExtension ('-':'f':name) = case name of
       "allow-overlapping-instances"    -> enable  OverlappingInstances
@@ -1088,6 +1062,27 @@ checkCabalVersion pkg =
         ++ "specify 'cabal-version: >= 1.4'. Alternatively if you require "
         ++ "compatibility with earlier Cabal versions then you may be able to "
         ++ "use an equivalent compiler-specific flag."
+
+  , check (specVersion pkg >= Version [1,23] []
+           && isNothing (setupBuildInfo pkg)
+           && buildType pkg == Just Custom) $
+      PackageBuildWarning $
+           "Packages using 'cabal-version: >= 1.23' with 'build-type: Custom' "
+        ++ "must use a 'custom-setup' section with a 'setup-depends' field "
+        ++ "that specifies the dependencies of the Setup.hs script itself. "
+        ++ "The 'setup-depends' field uses the same syntax as 'build-depends', "
+        ++ "so a simple example would be 'setup-depends: base, Cabal'."
+
+  , check (specVersion pkg < Version [1,23] []
+           && isNothing (setupBuildInfo pkg)
+           && buildType pkg == Just Custom) $
+      PackageBuildWarning $
+           "From version 1.23 cabal supports specifiying explicit dependencies "
+        ++ "for Custom setup scripts. Consider using cabal-version >= 1.23 and "
+        ++ "adding a 'custom-setup' section with a 'setup-depends' field "
+        ++ "that specifies the dependencies of the Setup.hs script itself. "
+        ++ "The 'setup-depends' field uses the same syntax as 'build-depends', "
+        ++ "so a simple example would be 'setup-depends: base, Cabal'."
   ]
   where
     -- Perform a check on packages that use a version of the spec less than
@@ -1283,7 +1278,7 @@ checkPackageVersions pkg =
         ++ "new major version of the 'base' package is released. If you are "
         ++ "not sure what upper bound to use then use the next  major "
         ++ "version. For example if you have tested your package with 'base' "
-        ++ "version 2 and 3 then use 'build-depends: base >= 2 && < 4'."
+        ++ "version 4.5 and 4.6 then use 'build-depends: base >= 4.5 && < 4.7'."
 
   ]
   where
@@ -1353,6 +1348,130 @@ checkConditionals pkg =
       COr  c1 c2 -> condfv c1 ++ condfv c2
       CAnd c1 c2 -> condfv c1 ++ condfv c2
 
+checkDevelopmentOnlyFlagsBuildInfo :: BuildInfo -> [PackageCheck]
+checkDevelopmentOnlyFlagsBuildInfo bi =
+  catMaybes [
+
+    check has_WerrorWall $
+      PackageDistInexcusable $
+           "'ghc-options: -Wall -Werror' makes the package very easy to "
+        ++ "break with future GHC versions because new GHC versions often "
+        ++ "add new warnings. Use just 'ghc-options: -Wall' instead."
+        ++ extraExplanation
+
+  , check (not has_WerrorWall && has_Werror) $
+      PackageDistInexcusable $
+           "'ghc-options: -Werror' makes the package easy to "
+        ++ "break with future GHC versions because new GHC versions often "
+        ++ "add new warnings. "
+        ++ extraExplanation
+
+  , checkFlags ["-fdefer-type-errors"] $
+      PackageDistInexcusable $
+           "'ghc-options: -fdefer-type-errors' is fine during development but "
+        ++ "is not appropriate for a distributed package. "
+        ++ extraExplanation
+
+    -- -dynamic is not a debug flag
+  , check (any (\opt -> "-d" `isPrefixOf` opt && opt /= "-dynamic")
+           ghc_options) $
+      PackageDistInexcusable $
+           "'ghc-options: -d*' debug flags are not appropriate "
+        ++ "for a distributed package. "
+        ++ extraExplanation
+
+  , checkFlags ["-fprof-auto", "-fprof-auto-top", "-fprof-auto-calls",
+               "-fprof-cafs", "-fno-prof-count-entries",
+               "-auto-all", "-auto", "-caf-all"] $
+      PackageDistSuspicious $
+           "'ghc-options: -fprof*' profiling flags are typically not "
+        ++ "appropriate for a distributed library package. These flags are "
+        ++ "useful to profile this package, but when profiling other packages "
+        ++ "that use this one these flags clutter the profile output with "
+        ++ "excessive detail. If you think other packages really want to see "
+        ++ "cost centres from this package then use '-fprof-auto-exported' "
+        ++ "which puts cost centres only on exported functions. "
+        ++ extraExplanation
+  ]
+  where
+    extraExplanation =
+         " Alternatively, if you want to use this, make it conditional based "
+      ++ "on a Cabal configuration flag (with 'manual: True' and 'default: "
+      ++ "False') and enable that flag during development."
+
+    has_WerrorWall   = has_Werror && ( has_Wall || has_W )
+    has_Werror       = "-Werror" `elem` ghc_options
+    has_Wall         = "-Wall"   `elem` ghc_options
+    has_W            = "-W"      `elem` ghc_options
+    ghc_options      = hcOptions GHC bi ++ hcProfOptions GHC bi
+
+    checkFlags :: [String] -> PackageCheck -> Maybe PackageCheck
+    checkFlags flags = check (any (`elem` flags) ghc_options)
+
+checkDevelopmentOnlyFlags :: GenericPackageDescription -> [PackageCheck]
+checkDevelopmentOnlyFlags pkg =
+    concatMap checkDevelopmentOnlyFlagsBuildInfo
+              [ bi
+              | (conditions, bi) <- allConditionalBuildInfo
+              , not (any guardedByManualFlag conditions) ]
+  where
+    guardedByManualFlag = definitelyFalse
+
+    -- We've basically got three-values logic here: True, False or unknown
+    -- hence this pattern to propagate the unknown cases properly.
+    definitelyFalse (Var (Flag n)) = maybe False not (Map.lookup n manualFlags)
+    definitelyFalse (Var _)        = False
+    definitelyFalse (Lit  b)       = not b
+    definitelyFalse (CNot c)       = definitelyTrue c
+    definitelyFalse (COr  c1 c2)   = definitelyFalse c1 && definitelyFalse c2
+    definitelyFalse (CAnd c1 c2)   = definitelyFalse c1 || definitelyFalse c2
+
+    definitelyTrue (Var (Flag n)) = fromMaybe False (Map.lookup n manualFlags)
+    definitelyTrue (Var _)        = False
+    definitelyTrue (Lit  b)       = b
+    definitelyTrue (CNot c)       = definitelyFalse c
+    definitelyTrue (COr  c1 c2)   = definitelyTrue c1 || definitelyTrue c2
+    definitelyTrue (CAnd c1 c2)   = definitelyTrue c1 && definitelyTrue c2
+
+    manualFlags = Map.fromList
+                    [ (flagName flag, flagDefault flag)
+                    | flag <- genPackageFlags pkg
+                    , flagManual flag ]
+
+    allConditionalBuildInfo :: [([Condition ConfVar], BuildInfo)]
+    allConditionalBuildInfo =
+        concatMap (collectCondTreePaths libBuildInfo)
+                  (maybeToList (condLibrary pkg))
+
+     ++ concatMap (collectCondTreePaths buildInfo . snd)
+                  (condExecutables pkg)
+
+     ++ concatMap (collectCondTreePaths testBuildInfo . snd)
+                  (condTestSuites pkg)
+
+     ++ concatMap (collectCondTreePaths benchmarkBuildInfo . snd)
+                  (condBenchmarks pkg)
+
+    -- get all the leaf BuildInfo, paired up with the path (in the tree sense)
+    -- of if-conditions that guard it
+    collectCondTreePaths :: (a -> b)
+                         -> CondTree v c a
+                         -> [([Condition v], b)]
+    collectCondTreePaths mapData = go []
+      where
+        go conditions condNode =
+            -- the data at this level in the tree:
+            (reverse conditions, mapData (condTreeData condNode))
+
+          : concat
+            [ go (condition:conditions) ifThen
+            | (condition, ifThen, _) <- condTreeComponents condNode ]
+
+         ++ concat
+            [ go (condition:conditions) elseThen
+            | (condition, _, Just elseThen) <- condTreeComponents condNode ]
+
+
 -- ------------------------------------------------------------
 -- * Checks involving files in the package
 -- ------------------------------------------------------------
@@ -1364,8 +1483,10 @@ checkPackageFiles :: PackageDescription -> FilePath -> IO [PackageCheck]
 checkPackageFiles pkg root = checkPackageContent checkFilesIO pkg
   where
     checkFilesIO = CheckPackageContentOps {
-      doesFileExist      = System.doesFileExist      . relative,
-      doesDirectoryExist = System.doesDirectoryExist . relative
+      doesFileExist        = System.doesFileExist                  . relative,
+      doesDirectoryExist   = System.doesDirectoryExist             . relative,
+      getDirectoryContents = System.Directory.getDirectoryContents . relative,
+      getFileContents      = \f -> openBinaryFile (relative f) ReadMode >>= hGetContents
     }
     relative path = root </> path
 
@@ -1373,8 +1494,10 @@ checkPackageFiles pkg root = checkPackageContent checkFilesIO pkg
 -- Used by 'checkPackageContent'.
 --
 data CheckPackageContentOps m = CheckPackageContentOps {
-    doesFileExist      :: FilePath -> m Bool,
-    doesDirectoryExist :: FilePath -> m Bool
+    doesFileExist        :: FilePath -> m Bool,
+    doesDirectoryExist   :: FilePath -> m Bool,
+    getDirectoryContents :: FilePath -> m [FilePath],
+    getFileContents      :: FilePath -> m String
   }
 
 -- | Sanity check things that requires looking at files in the package.
@@ -1388,6 +1511,7 @@ checkPackageContent :: Monad m => CheckPackageContentOps m
                     -> PackageDescription
                     -> m [PackageCheck]
 checkPackageContent ops pkg = do
+  cabalBomError   <- checkCabalFileBOM    ops
   licenseErrors   <- checkLicensesExist   ops pkg
   setupError      <- checkSetupExists     ops pkg
   configureError  <- checkConfigureExists ops pkg
@@ -1395,9 +1519,48 @@ checkPackageContent ops pkg = do
   vcsLocation     <- checkMissingVcsInfo  ops pkg
 
   return $ licenseErrors
-        ++ catMaybes [setupError, configureError]
+        ++ catMaybes [cabalBomError, setupError, configureError]
         ++ localPathErrors
         ++ vcsLocation
+
+checkCabalFileBOM :: Monad m => CheckPackageContentOps m
+                  -> m (Maybe PackageCheck)
+checkCabalFileBOM ops = do
+  epdfile <- findPackageDesc ops
+  case epdfile of
+    Left pc      -> return $ Just pc
+    Right pdfile -> (flip check pc . startsWithBOM . fromUTF8) `liftM` (getFileContents ops pdfile)
+                       where pc = PackageDistInexcusable $
+                                    pdfile ++ " starts with an Unicode byte order mark (BOM). This may cause problems with older cabal versions."
+
+-- |Find a package description file in the given directory.  Looks for
+-- @.cabal@ files.
+findPackageDesc :: Monad m => CheckPackageContentOps m
+                 -> m (Either PackageCheck FilePath) -- ^<pkgname>.cabal
+findPackageDesc ops
+ = do let dir = "."
+      files <- getDirectoryContents ops dir
+      -- to make sure we do not mistake a ~/.cabal/ dir for a <pkgname>.cabal
+      -- file we filter to exclude dirs and null base file names:
+      cabalFiles <- filterM (doesFileExist ops)
+                       [ dir </> file
+                       | file <- files
+                       , let (name, ext) = splitExtension file
+                       , not (null name) && ext == ".cabal" ]
+      case cabalFiles of
+        []          -> return (Left $ PackageBuildImpossible noDesc)
+        [cabalFile] -> return (Right cabalFile)
+        multiple    -> return (Left $ PackageBuildImpossible $ multiDesc multiple)
+
+  where
+    noDesc :: String
+    noDesc = "No cabal file found.\n"
+             ++ "Please create a package description file <pkgname>.cabal"
+
+    multiDesc :: [String] -> String
+    multiDesc l = "Multiple cabal files found.\n"
+                  ++ "Please use only one of: "
+                  ++ intercalate ", " l
 
 checkLicensesExist :: Monad m => CheckPackageContentOps m
                    -> PackageDescription

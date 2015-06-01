@@ -22,6 +22,7 @@ module Distribution.Client.Setup
     , listCommand, ListFlags(..)
     , updateCommand
     , upgradeCommand
+    , uninstallCommand
     , infoCommand, InfoFlags(..)
     , fetchCommand, FetchFlags(..)
     , freezeCommand, FreezeFlags(..)
@@ -736,9 +737,7 @@ freezeCommand = CommandUI {
       ++ "\n"
       ++ "An existing `cabal.config` is ignored and overwritten.\n",
     commandNotes        = Nothing,
-    commandUsage        = usageAlternatives "freeze" [""
-                                                     ,"PACKAGES"
-                                                     ],
+    commandUsage        = usageFlags "freeze",
     commandDefaultFlags = defaultFreezeFlags,
     commandOptions      = \ showOrParseArgs -> [
          optionVerbosity freezeVerbosity (\v flags -> flags { freezeVerbosity = v })
@@ -833,6 +832,17 @@ formatCommand = CommandUI {
     commandDescription  = Nothing,
     commandNotes        = Nothing,
     commandUsage        = usageAlternatives "format" ["[FILE]"],
+    commandDefaultFlags = toFlag normal,
+    commandOptions      = \_ -> []
+  }
+
+uninstallCommand  :: CommandUI (Flag Verbosity)
+uninstallCommand = CommandUI {
+    commandName         = "uninstall",
+    commandSynopsis     = "Warn about 'uninstall' not being implemented.",
+    commandDescription  = Nothing,
+    commandNotes        = Nothing,
+    commandUsage        = usageAlternatives "uninstall" ["PACKAGES"],
     commandDefaultFlags = toFlag normal,
     commandOptions      = \_ -> []
   }
@@ -1144,7 +1154,8 @@ data InstallFlags = InstallFlags {
     installSymlinkBinDir    :: Flag FilePath,
     installOneShot          :: Flag Bool,
     installNumJobs          :: Flag (Maybe Int),
-    installRunTests         :: Flag Bool
+    installRunTests         :: Flag Bool,
+    installOfflineMode      :: Flag Bool
   }
 
 defaultInstallFlags :: InstallFlags
@@ -1171,7 +1182,8 @@ defaultInstallFlags = InstallFlags {
     installSymlinkBinDir   = mempty,
     installOneShot         = Flag False,
     installNumJobs         = mempty,
-    installRunTests        = mempty
+    installRunTests        = mempty,
+    installOfflineMode     = Flag False
   }
   where
     docIndexFile = toPathTemplate ("$datadir" </> "doc"
@@ -1382,6 +1394,10 @@ installOptions showOrParseArgs =
       , optionNumJobs
         installNumJobs (\v flags -> flags { installNumJobs = v })
 
+      , option [] ["offline"]
+          "Don't download packages from the Internet."
+          installOfflineMode (\v flags -> flags { installOfflineMode = v })
+          (yesNoOpt showOrParseArgs)
       ] ++ case showOrParseArgs of      -- TODO: remove when "cabal install"
                                         -- avoids
           ParseArgs ->
@@ -1416,7 +1432,8 @@ instance Monoid InstallFlags where
     installSymlinkBinDir   = mempty,
     installOneShot         = mempty,
     installNumJobs         = mempty,
-    installRunTests        = mempty
+    installRunTests        = mempty,
+    installOfflineMode     = mempty
   }
   mappend a b = InstallFlags {
     installDocumentation   = combine installDocumentation,
@@ -1441,7 +1458,8 @@ instance Monoid InstallFlags where
     installSymlinkBinDir   = combine installSymlinkBinDir,
     installOneShot         = combine installOneShot,
     installNumJobs         = combine installNumJobs,
-    installRunTests        = combine installRunTests
+    installRunTests        = combine installRunTests,
+    installOfflineMode     = combine installOfflineMode
   }
     where combine field = field a `mappend` field b
 

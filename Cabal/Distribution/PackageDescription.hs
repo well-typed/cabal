@@ -98,12 +98,16 @@ module Distribution.PackageDescription (
         GenericPackageDescription(..),
         Flag(..), FlagName(..), FlagAssignment,
         CondTree(..), ConfVar(..), Condition(..),
+        cNot,
 
         -- * Source repositories
         SourceRepo(..),
         RepoKind(..),
         RepoType(..),
         knownRepoTypes,
+
+        -- * Custom setup build information
+        SetupBuildInfo(..),
   ) where
 
 import Distribution.Compat.Binary (Binary)
@@ -112,10 +116,14 @@ import Data.Foldable              (traverse_)
 import Data.List                  (nub, intercalate)
 import Data.Maybe                 (fromMaybe, maybeToList)
 #if __GLASGOW_HASKELL__ < 710
+import Control.Applicative        (Applicative((<*>), pure))
 import Data.Monoid                (Monoid(mempty, mappend))
+import Data.Foldable              (Foldable(foldMap))
+import Data.Traversable           (Traversable(traverse))
 #endif
 import Data.Typeable               ( Typeable )
-import Control.Monad               (MonadPlus(mplus))
+import Control.Applicative         (Alternative(..))
+import Control.Monad               (MonadPlus(mplus,mzero), ap)
 import GHC.Generics                (Generic)
 import Text.PrettyPrint as Disp
 import qualified Distribution.Compat.ReadP as Parse
@@ -187,6 +195,7 @@ data PackageDescription
         -- transitioning to specifying just a single version, not a range.
         specVersionRaw :: Either Version VersionRange,
         buildType      :: Maybe BuildType,
+        setupBuildInfo :: Maybe SetupBuildInfo,
         -- components
         library        :: Maybe Library,
         executables    :: [Executable],
@@ -254,6 +263,7 @@ emptyPackageDescription
                       description  = "",
                       category     = "",
                       customFieldsPD = [],
+                      setupBuildInfo = Nothing,
                       library      = Nothing,
                       executables  = [],
                       testSuites   = [],
@@ -297,6 +307,29 @@ instance Text BuildType where
       "Custom"    -> Custom
       "Make"      -> Make
       _           -> UnknownBuildType name
+
+-- ---------------------------------------------------------------------------
+-- The SetupBuildInfo type
+
+-- One can see this as a very cut-down version of BuildInfo below.
+-- To keep things simple for tools that compile Setup.hs we limit the
+-- options authors can specify to just Haskell package dependencies.
+
+data SetupBuildInfo = SetupBuildInfo {
+        setupDepends :: [Dependency]
+    }
+    deriving (Generic, Show, Eq, Read, Typeable, Data)
+
+instance Binary SetupBuildInfo
+
+instance Monoid SetupBuildInfo where
+  mempty = SetupBuildInfo {
+    setupDepends = mempty
+  }
+  mappend a b = SetupBuildInfo {
+    setupDepends = combine setupDepends
+  }
+    where combine field = field a `mappend` field b
 
 -- ---------------------------------------------------------------------------
 -- Module renaming
@@ -1144,6 +1177,58 @@ data Condition c = Var c
                  | COr (Condition c) (Condition c)
                  | CAnd (Condition c) (Condition c)
     deriving (Show, Eq, Typeable, Data)
+
+cNot :: Condition a -> Condition a
+cNot (Lit b)  = Lit (not b)
+cNot (CNot c) = c
+cNot c        = CNot c
+
+instance Functor Condition where
+  f `fmap` Var c    = Var (f c)
+  _ `fmap` Lit c    = Lit c
+  f `fmap` CNot c   = CNot (fmap f c)
+  f `fmap` COr c d  = COr  (fmap f c) (fmap f d)
+  f `fmap` CAnd c d = CAnd (fmap f c) (fmap f d)
+
+instance Foldable Condition where
+  f `foldMap` Var c    = f c
+  _ `foldMap` Lit _    = mempty
+  f `foldMap` CNot c   = foldMap f c
+  f `foldMap` COr c d  = foldMap f c `mappend` foldMap f d
+  f `foldMap` CAnd c d = foldMap f c `mappend` foldMap f d
+
+instance Traversable Condition where
+  f `traverse` Var c    = Var `fmap` f c
+  _ `traverse` Lit c    = pure $ Lit c
+  f `traverse` CNot c   = CNot `fmap` traverse f c
+  f `traverse` COr c d  = COr  `fmap` traverse f c <*> traverse f d
+  f `traverse` CAnd c d = CAnd `fmap` traverse f c <*> traverse f d
+
+instance Applicative Condition where
+  pure  = return
+  (<*>) = ap
+
+instance Monad Condition where
+  return = Var
+  -- Terminating cases
+  (>>=) (Lit x) _ = Lit x
+  (>>=) (Var x) f = f x
+  -- Recursing cases
+  (>>=) (CNot  x  ) f = CNot (x >>= f)
+  (>>=) (COr   x y) f = COr  (x >>= f) (y >>= f)
+  (>>=) (CAnd  x y) f = CAnd (x >>= f) (y >>= f)
+
+instance Monoid (Condition a) where
+  mempty = Lit False
+  mappend = COr
+
+instance Alternative Condition where
+  empty = mempty
+  (<|>) = mappend
+
+instance MonadPlus Condition where
+  mzero = mempty
+  mplus = mappend
 
 data CondTree v c a = CondNode
     { condTreeData        :: a

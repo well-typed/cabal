@@ -254,10 +254,23 @@ preferBaseGoalChoice = trav go
     go (GoalChoiceF xs) = GoalChoiceF (P.sortByKeys preferBase xs)
     go x                = x
 
-    preferBase :: OpenGoal -> OpenGoal -> Ordering
-    preferBase (OpenGoal (Simple (Dep (Q _pp pn) _)) _) _ | unPN pn == "base" = LT
-    preferBase _ (OpenGoal (Simple (Dep (Q _pp pn) _)) _) | unPN pn == "base" = GT
-    preferBase _ _                                                            = EQ
+    preferBase :: OpenGoal comp -> OpenGoal comp -> Ordering
+    preferBase (OpenGoal (Simple (Dep (Q _pp pn) _) _) _) _ | unPN pn == "base" = LT
+    preferBase _ (OpenGoal (Simple (Dep (Q _pp pn) _) _) _) | unPN pn == "base" = GT
+    preferBase _ _                                                              = EQ
+
+-- | Deal with setup dependencies after regular dependencies, so that we can
+-- will link setup depencencies against package dependencies when possible
+deferSetupChoices :: Tree a -> Tree a
+deferSetupChoices = trav go
+  where
+    go (GoalChoiceF xs) = GoalChoiceF (P.sortByKeys deferSetup xs)
+    go x                = x
+
+    deferSetup :: OpenGoal comp -> OpenGoal comp -> Ordering
+    deferSetup (OpenGoal (Simple (Dep (Q (Setup _ _) _) _) _) _) _ = GT
+    deferSetup _ (OpenGoal (Simple (Dep (Q (Setup _ _) _) _) _) _) = LT
+    deferSetup _ _                                                 = EQ
 
 -- | Transformation that sorts choice nodes so that
 -- child nodes with a small branching degree are preferred. As a
@@ -318,16 +331,11 @@ enforceSingleInstanceRestriction = (`runReader` M.empty) . cata go
   where
     go :: TreeF QGoalReasonChain (EnforceSIR (Tree QGoalReasonChain)) -> EnforceSIR (Tree QGoalReasonChain)
 
-    -- We just verify package choices
+    -- We just verify package choices.
     go (PChoiceF qpn gr cs) =
       PChoice qpn gr <$> sequence (P.mapWithKey (goP qpn) cs)
-
-    -- For all other nodes we don't check anything
-    go (FChoiceF qfn gr t m cs)       = FChoice qfn gr t m <$> sequence cs
-    go (SChoiceF qsn gr t   cs)       = SChoice qsn gr t   <$> sequence cs
-    go (GoalChoiceF         cs)       = GoalChoice         <$> sequence cs
-    go (DoneF revDepMap)              = return $ Done revDepMap
-    go (FailF conflictSet failReason) = return $ Fail conflictSet failReason
+    go _otherwise =
+      innM _otherwise
 
     -- The check proper
     goP :: QPN -> POption -> EnforceSIR (Tree QGoalReasonChain) -> EnforceSIR (Tree QGoalReasonChain)

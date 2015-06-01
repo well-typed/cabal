@@ -65,11 +65,15 @@ import Distribution.Version
          ( Version, withinRange )
 import Distribution.PackageDescription
          ( GenericPackageDescription(genPackageFlags)
-         , Flag(flagName), FlagName(..) )
+         , Flag(flagName), FlagName(..)
+         , SetupBuildInfo(..), setupBuildInfo
+         )
 import Distribution.Client.PackageUtils
          ( externalBuildDepends )
 import Distribution.Client.PackageIndex
          ( PackageFixedDeps(..) )
+import Distribution.Client.ComponentDeps (ComponentDeps)
+import qualified Distribution.Client.ComponentDeps as CD
 import Distribution.PackageDescription.Configuration
          ( finalizePackageDescription )
 import Distribution.Simple.PackageIndex
@@ -91,15 +95,17 @@ import Distribution.Simple.Utils
 import qualified Distribution.InstalledPackageInfo as Installed
 
 import Data.List
-         ( sort, sortBy )
+         ( sort, sortBy, nubBy )
 import Data.Maybe
          ( fromMaybe, maybeToList )
 import qualified Data.Graph as Graph
+import Data.Function (on)
 import Data.Graph (Graph)
 import Control.Exception
          ( assert )
 import Data.Maybe (catMaybes)
 import qualified Data.Map as Map
+import qualified Data.Traversable as T
 
 type PlanIndex = PackageIndex PlanPackage
 
@@ -300,8 +306,8 @@ ready plan = assert check readyPackages
       , deps <- maybeToList (hasAllInstalledDeps pkg)
       ]
 
-    hasAllInstalledDeps :: ConfiguredPackage -> Maybe [Installed.InstalledPackageInfo]
-    hasAllInstalledDeps = mapM isInstalledDep . depends
+    hasAllInstalledDeps :: ConfiguredPackage -> Maybe (ComponentDeps [Installed.InstalledPackageInfo])
+    hasAllInstalledDeps = T.mapM (mapM isInstalledDep) . depends
 
     isInstalledDep :: InstalledPackageId -> Maybe Installed.InstalledPackageInfo
     isInstalledDep pkgid =
@@ -491,7 +497,7 @@ problems platform cinfo fakeMap indepGoals index =
 
   ++ [ PackageStateInvalid pkg pkg'
      | pkg <- PackageIndex.allPackages index
-     , Just pkg' <- map (PlanIndex.fakeLookupInstalledPackageId fakeMap index) (depends pkg)
+     , Just pkg' <- map (PlanIndex.fakeLookupInstalledPackageId fakeMap index) (CD.nonSetupDeps (depends pkg))
      , not (stateDependencyRelation pkg pkg') ]
 
 -- | The graph of packages (nodes) and dependencies (edges) must be acyclic.
@@ -612,23 +618,18 @@ configuredPackageProblems platform cinfo
   ++ [ MissingFlag flag | OnlyInLeft  flag <- mergedFlags ]
   ++ [ ExtraFlag   flag | OnlyInRight flag <- mergedFlags ]
   ++ [ DuplicateDeps pkgs
-     | pkgs <- duplicatesBy (comparing packageName) specifiedDeps ]
+     | pkgs <- CD.nonSetupDeps (fmap (duplicatesBy (comparing packageName)) specifiedDeps) ]
   ++ [ MissingDep dep       | OnlyInLeft  dep       <- mergedDeps ]
   ++ [ ExtraDep       pkgid | OnlyInRight     pkgid <- mergedDeps ]
   ++ [ InvalidDep dep pkgid | InBoth      dep pkgid <- mergedDeps
                             , not (packageSatisfiesDependency pkgid dep) ]
   where
-    specifiedDeps :: [PackageId]
-    specifiedDeps = map confSrcId specifiedDeps'
+    specifiedDeps :: ComponentDeps [PackageId]
+    specifiedDeps = fmap (map confSrcId) specifiedDeps'
 
     mergedFlags = mergeBy compare
       (sort $ map flagName (genPackageFlags (packageDescription pkg)))
       (sort $ map fst specifiedFlags)
-
-    mergedDeps = mergeBy
-      (\dep pkgid -> dependencyName dep `compare` packageName pkgid)
-      (sortBy (comparing dependencyName) requiredDeps)
-      (sortBy (comparing packageName)    specifiedDeps)
 
     packageSatisfiesDependency
       (PackageIdentifier name  version)
@@ -637,6 +638,24 @@ configuredPackageProblems platform cinfo
 
     dependencyName (Dependency name _) = name
 
+    mergedDeps :: [MergeResult Dependency PackageId]
+    mergedDeps = mergeDeps requiredDeps (CD.flatDeps specifiedDeps)
+
+    mergeDeps :: [Dependency] -> [PackageId] -> [MergeResult Dependency PackageId]
+    mergeDeps required specified =
+      let sortNubOn f = nubBy ((==) `on` f) . sortBy (compare `on` f) in
+      mergeBy
+        (\dep pkgid -> dependencyName dep `compare` packageName pkgid)
+        (sortNubOn dependencyName required)
+        (sortNubOn packageName    specified)
+
+    -- TODO: It would be nicer to use ComponentDeps here so we can be more precise
+    -- in our checks. That's a bit tricky though, as this currently relies on
+    -- the 'buildDepends' field of 'PackageDescription'. (OTOH, that field is
+    -- deprecated and should be removed anyway.)
+    -- As long as we _do_ use a flat list here, we have to allow for duplicates
+    -- when we fold specifiedDeps; once we have proper ComponentDeps here we
+    -- should get rid of the `nubOn` in `mergeDeps`.
     requiredDeps :: [Dependency]
     requiredDeps =
       --TODO: use something lower level than finalizePackageDescription
@@ -645,8 +664,11 @@ configuredPackageProblems platform cinfo
          platform cinfo
          []
          (enableStanzas stanzas $ packageDescription pkg) of
-        Right (resolvedPkg, _) -> externalBuildDepends resolvedPkg
-        Left  _ -> error "configuredPackageInvalidDeps internal error"
+        Right (resolvedPkg, _) ->
+             externalBuildDepends resolvedPkg
+          ++ maybe [] setupDepends (setupBuildInfo resolvedPkg)
+        Left  _ ->
+          error "configuredPackageInvalidDeps internal error"
 
 -- | Compute the dependency closure of a _source_ package in a install plan
 --
