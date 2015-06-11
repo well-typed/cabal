@@ -59,6 +59,8 @@ module Distribution.Client.Dependency (
     removeUpperBounds
   ) where
 
+import Distribution.Client.Dependency.ExternalSMT
+         ( externalSMTResolver )
 import Distribution.Client.Dependency.TopDown
          ( topDownResolver )
 import Distribution.Client.Dependency.Modular
@@ -490,6 +492,9 @@ chooseSolver verbosity preSolver _cinfo =
         return TopDown
       AlwaysModular -> do
         return Modular
+      AlwaysExternalSMT -> do
+        warn verbosity "Using experimental ExternalSMT solver."  
+        return ExternalSMT
       Choose -> do
         info verbosity "Choosing modular solver."
         return Modular
@@ -497,6 +502,7 @@ chooseSolver verbosity preSolver _cinfo =
 runSolver :: Solver -> SolverConfig -> DependencyResolver
 runSolver TopDown = const topDownResolver -- TODO: warn about unsupported options
 runSolver Modular = modularResolver
+runSolver ExternalSMT = externalSMTResolver
 
 -- | Run the dependency solver.
 --

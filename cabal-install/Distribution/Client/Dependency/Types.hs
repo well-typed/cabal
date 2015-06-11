@@ -86,24 +86,26 @@ instance Text ExtDependency where
   parse = (SourceDependency `fmap` parse) <++ (InstalledDependency `fmap` parse)
 
 -- | All the solvers that can be selected.
-data PreSolver = AlwaysTopDown | AlwaysModular | Choose
+data PreSolver = AlwaysTopDown | AlwaysModular | AlwaysExternalSMT | Choose
   deriving (Eq, Ord, Show, Bounded, Enum)
 
 -- | All the solvers that can be used.
-data Solver = TopDown | Modular
+data Solver = TopDown | Modular | ExternalSMT
   deriving (Eq, Ord, Show, Bounded, Enum)
 
 instance Text PreSolver where
   disp AlwaysTopDown = text "topdown"
   disp AlwaysModular = text "modular"
+  disp AlwaysModular = text "externalsmt"
   disp Choose        = text "choose"
   parse = do
     name <- Parse.munch1 isAlpha
     case map toLower name of
-      "topdown" -> return AlwaysTopDown
-      "modular" -> return AlwaysModular
-      "choose"  -> return Choose
-      _         -> Parse.pfail
+      "topdown"     -> return AlwaysTopDown
+      "modular"     -> return AlwaysModular
+      "externalsmt" -> return AlwaysExternalSMT
+      "choose"      -> return Choose
+      _             -> Parse.pfail
 
 -- | A dependency resolver is a function that works out an installation plan
 -- given the set of installed and available packages and a set of deps to
@@ -116,7 +118,7 @@ instance Text PreSolver where
 type DependencyResolver = Platform
                        -> CompilerInfo
                        -> InstalledPackageIndex
-                       ->          PackageIndex.PackageIndex SourcePackage
+                       -> PackageIndex.PackageIndex SourcePackage
                        -> (PackageName -> PackagePreferences)
                        -> [PackageConstraint]
                        -> [PackageName]
