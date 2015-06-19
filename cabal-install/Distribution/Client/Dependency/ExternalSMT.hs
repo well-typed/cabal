@@ -10,16 +10,27 @@ module Distribution.Client.Dependency.ExternalSMT
 
     ResolvedInstance,
 
+    InstanceVersion,
+    getVersion,
+    isSourceInstance,
+    isInstalledInstance,
+
     mkSymConstraint,
 
-    externalSMTResolver
+    externalSMTResolver,
+
+    toPackageIds,
+    prettyPackageId,
+
+    constraintPkgName,
+    installedIdtoDep
   ) where
 
 
 import Distribution.Client.Dependency.Modular.Solver
   ( SolverConfig(..) )
 import Distribution.Client.Dependency.Types
-  ( DependencyResolver, Progress(..) )
+  ( DependencyResolver, Progress(..), PackageConstraint(..) )
 import Distribution.System
   ( Platform(..) )
 import Distribution.Client.Types
@@ -29,20 +40,27 @@ import qualified Distribution.PackageDescription as PD
     PackageDescription(..),    
     Library(..),
     BuildInfo(..),
-    CondTree(..) ) 
+    CondTree(..) )
+import qualified Distribution.Simple.PackageIndex as PI
+import Distribution.InstalledPackageInfo
+  ( InstalledPackageInfo_(..) )
 import Distribution.Package
     ( PackageName(..),
       Dependency(..),
       PackageIdentifier(..),
+      InstalledPackageId(..),
       packageVersion )
 import Distribution.Client.PackageIndex
   ( lookupPackageName )
 import Distribution.Version
+import Data.Version ( parseVersion )
 
 import qualified Data.Map as M
 import qualified Data.Set as S
-import Data.Maybe (fromMaybe, fromJust)
+import Data.Maybe (fromMaybe, fromJust, mapMaybe)
 import Data.List
+import Data.List.Split
+import Text.ParserCombinators.ReadP (readP_to_S)
 import Data.Function (on)
 
 import Data.SBV
@@ -64,14 +82,42 @@ type SDepConstraints = M.Map PackageName [SConstraint]
 data SPackage = SPackage {
   spkgName            :: PackageName,
   spkgNumInstances    :: SWord32,
+  spkgConstraints     :: [SConstraint],
   spkgSDepConstraints :: [SDepConstraints],
   spkgSVersion        :: SVersion
 }
 
 
-type VersionSymbolMap = M.Map Version SVersion
-type SymbolVersionMap = M.Map Word32 Version
+type VersionSymbolMap = M.Map InstanceVersion SVersion
+type SymbolVersionMap = M.Map Word32 InstanceVersion
 type VersionMappings  = M.Map PackageName (VersionSymbolMap, SymbolVersionMap)
+
+
+data InstanceVersion = SI Version
+                     | II Version
+                       deriving (Show, Eq)
+
+instance Ord InstanceVersion where
+  (SI x) `compare` (SI y) = x `compare` y
+  (II x) `compare` (II y) = x `compare` y
+  (SI x) `compare` (II y)
+    | x == y    = LT
+    | otherwise = x `compare` y
+  (II x) `compare` (SI y)
+    | x == y    = GT
+    | otherwise = x `compare` y
+
+getVersion :: InstanceVersion -> Version
+getVersion (SI v) = v
+getVersion (II v) = v
+
+isSourceInstance :: InstanceVersion -> Bool
+isSourceInstance (SI _) = True
+isSourceInstance _      = False
+
+isInstalledInstance :: InstanceVersion -> Bool
+isInstalledInstance (II _) = True
+isInstalledInstance _      = False
 
 
 mkSymConstraint :: VersionMappings -> Dependency -> SConstraint
@@ -80,20 +126,25 @@ mkSymConstraint vms (Dependency pn vr) = mkConstraint vr
     -- TODO: clean up
     mkConstraint AnyVersion             = const true
     mkConstraint (ThisVersion v)        =
-      maybe (const false) (.==) (M.lookup v vts)
+      let xs = takeWhile ((== v) . getVersion . fst)
+             . dropWhile ((/= v) . getVersion . fst)
+             $ M.toList vts
+      in if null xs
+         then const false
+         else \s -> s .>= (snd $ head xs) &&& s .<= (snd $ last xs)
     mkConstraint (LaterVersion v)       =
-      let xs = dropWhile ((<= v) . fst) $ M.toList vts
+      let xs = dropWhile ((<= v) . getVersion . fst) $ M.toList vts
       in if null xs
          then const false
          else \s -> s .> (snd $ head xs)
     mkConstraint (EarlierVersion v)     =
-      let xs = dropWhile ((<= v) . fst) $ M.toList vts
+      let xs = dropWhile ((<= v) . getVersion . fst) $ M.toList vts
       in if null xs
          then const false
          else \s -> s .< (snd $ head xs)
     mkConstraint vr'@(WildcardVersion _) =
-      let xs = takeWhile ((\v -> withinRange v vr') . fst)
-             . dropWhile ((not . (\v -> withinRange v vr')) . fst)
+      let xs = takeWhile ((`withinRange` vr') . getVersion . fst)
+             . dropWhile ((not . (`withinRange` vr')) . getVersion . fst)
              $ M.toList vts
       in if null xs 
          then const false
@@ -112,58 +163,84 @@ mkSymConstraint vms (Dependency pn vr) = mkConstraint vr
 valid :: S.Set PackageName -> [SPackage] -> SBool
 valid targets spkgs = bAll checkPkg spkgs
   where
-    checkPkg (SPackage pn ni _ ver)
-      | pn `S.member` targets = ver ./= 0
-                            &&& rangeFine ni ver
-                            &&& checkConstraints pn ver
-      | otherwise             = rangeFine ni ver
-                            &&& checkConstraints pn ver
+    checkPkg (SPackage pn ni pcs _ ver)
+      | pn `S.member` targets = ver ./= 0 &&& validPkg pn ni pcs ver
+      | otherwise             = isNeeded pn ver &&& validPkg pn ni pcs ver
+    validPkg pn ni pcs ver = rangeFine ni ver
+                         &&& checkConstraints ver pcs
+                         &&& checkDepConstraints pn ver
     rangeFine ni ver = ver .>= 0 &&& ver .<= ni
-    checkConstraints pn ver = bAll (checkPkgConstraints pn ver) spkgs
-    checkPkgConstraints pn ver (SPackage _ _ dcs ver') =
-          ver' .== 0 |||
-          bOr (zipWith (\v dcs' -> v .== ver' &&&
-                         bAll ($ ver)
-                              (fromMaybe [] $ ((./= 0) :) <$> M.lookup pn dcs')
-                       ) [1..] dcs)
+    checkConstraints ver cs = bAll ($ ver) cs
+    isNeeded pn ver = ite (bAny (requires pn ver) spkgs) (ver ./= 0) (ver .== 0)
+    requires pn ver (SPackage _ _ _ dcs ver') =
+      ver' ./= 0 &&&
+      bOr (zipWith (\v dcs' -> v .== ver' &&&
+                     if pn `M.member` dcs' then true else false
+                   ) [1..] dcs)
+    checkDepConstraints pn ver = bAll (checkPkgDepConstraints pn ver) spkgs
+    checkPkgDepConstraints pn ver (SPackage _ _ _ dcs ver') =
+      ver' .== 0 |||
+      bOr (zipWith (\v dcs' -> v .== ver' &&&
+                     bAll ($ ver) (maybe [] ((./= 0) :) $ M.lookup pn dcs')
+                   ) [1..] dcs)
 
 
 solveSMT :: S.Set PackageName
          -> [PackageName]
          -> [SWord32]
+         -> [[SConstraint]]
          -> [[SDepConstraints]]
          -> IO [ResolvedInstance]
-solveSMT targets pns nis dcs = do
+solveSMT targets pns nis pcs dcs = do
   model <- getModel <$> sat ( (valid targets . mkSPkgs) <$>
                               mkExistVars (length pns) )
   case model of
     Right (_, sln) -> return $ zip pns sln
-    Left  m        -> print m >> return []
+    Left  m        -> return []
+  --model <- maximize Quantified sum (length pns) (valid targets . mkSPkgs)
+  --return $ maybe [] (zip pns) model
   where
-    mkSPkgs              = map (uncurry4 SPackage) . zip4 pns nis dcs
-    uncurry4 f (a,b,c,d) = f a b c d
+    mkSPkgs                = map (uncurry5 SPackage) . zip5 pns nis pcs dcs
+    uncurry5 f (a,b,c,d,e) = f a b c d e
 
 
--- TODO: - use all package instances, not just source packages
---       - make it adhere to all Cabal flags and constraints
+-- TODO: - flags, stanzas, etc
+--       - fix bugs
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
-  sln <- solveSMT (S.fromList pns) allTargets nis dcs
+  sln <- solveSMT (S.fromList pns) allTargets nis pcs' dcs
   let sln' = toPackageIds vms $ filter ((/= 0) . snd) sln
   print $ map prettyPackageId sln'
   return $ Fail "not fully implemented yet"
   where
     nis :: [SWord32]
-    nis = map (fromIntegral . length . pkgVersions) allTargets
+    nis = map (fromIntegral . length . pkgInstances) allTargets
+
+    pcs' :: [[SConstraint]]
+    pcs' = map (map toSConstraint . groupConstraints) allTargets
+
+    groupConstraints :: PackageName -> [PackageConstraint]
+    groupConstraints pn = filter (\pc -> pn == constraintPkgName pc) pcs
+
+    toSConstraint :: PackageConstraint -> SConstraint
+    toSConstraint (PackageConstraintVersion pn vr) =
+      mkSymConstraint vms (Dependency pn vr)
+    toSConstraint (PackageConstraintInstalled pn) = (\s -> bAny ($ s) cs)
+      where cs = map ((.==) . snd)
+               . filter (isInstalledInstance . fst)
+               -- TODO: fromJust…
+               . M.toList . fst . fromJust $ M.lookup pn vms
+    toSConstraint _ = const true
 
     dcs :: [[SDepConstraints]]
-    dcs = map (map (M.fromList . map (\d -> (depname d, [mkSymConstraint vms d]))))
-        . map buildDeps $ allTargets
+    dcs = map ( map (M.fromList
+              . map (\d -> (depname d, [mkSymConstraint vms d])))
+              . buildDeps ) allTargets
 
     vms :: VersionMappings
     vms = M.fromList
         $ zip allTargets
-        $ map (\pn -> mkVersionMaps (sort $ pkgVersions pn)) allTargets
+        $ map (mkVersionMaps . pkgInstances) allTargets
 
     allTargets :: [PackageName]
     allTargets = S.toList $ depdfs S.empty pns
@@ -172,19 +249,23 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
 
     mkVersionMaps vs = (M.fromList $ zip vs [1..], M.fromList $ zip [1..] vs)
 
-    pkgs = lookupPackageName sidx
-
-    pkgVersions = map packageVersion . pkgs
+    pkgInstances pn = sort $ map (II . fst) (PI.lookupPackageName iidx pn)
+                          ++ map (SI . packageVersion) (lookupPackageName sidx pn)
 
     buildDeps :: PackageName -> [[Dependency]]
-    buildDeps (PackageName "base") = [[]]
-    buildDeps pn  = map (\p -> maybe []
-                                     ( PD.targetBuildDepends
-                                     . PD.libBuildInfo
-                                     . PD.condTreeData )
-                                     (PD.condLibrary $ packageDescription p) )
-                  . sortBy (compare `on` packageVersion)
-                  . pkgs $ pn
+    buildDeps pn = map snd
+                 . sortBy (compare `on` fst)
+                 $ ((map (\p -> (packageVersion (packageDescription p),
+                              maybe []
+                                    ( PD.targetBuildDepends
+                                    . PD.libBuildInfo
+                                    . PD.condTreeData )
+                                    (PD.condLibrary $ packageDescription p)) )
+                 . lookupPackageName sidx $ pn)
+                ++ map (\p -> (fst p, 
+                               concatMap (mapMaybe installedIdtoDep . depends)
+                               $ snd p) )
+                       (PI.lookupPackageName iidx pn) )
 
     depdfs :: S.Set PackageName -> [PackageName] -> S.Set PackageName
     depdfs visited [] = visited
@@ -192,17 +273,15 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
       | x `S.member` visited = depdfs visited xs
       | otherwise            = depdfs (S.insert x visited) (xs ++ childdeps)
       where
-        childdeps = concatMap ( filter ((not) . (`S.member` visited))
-                              . (map depname)
-                              ) (buildDeps x)
+        childdeps = concatMap (map depname) (buildDeps x)
 
 
 toPackageIds :: VersionMappings -> [ResolvedInstance] -> [PackageIdentifier]
-toPackageIds vms ris = map toPkgId ris
+toPackageIds vms = map toPkgId
   where
     -- TODO: fix this
     toPkgId (pn,sv) = let (_, stv) = fromJust $ M.lookup pn vms
-                          ver      = fromJust $ M.lookup sv stv
+                          ver      = getVersion $ fromJust $ M.lookup sv stv
                       in PackageIdentifier pn ver
 
 
@@ -210,3 +289,20 @@ prettyPackageId :: PackageIdentifier -> String
 prettyPackageId pkgid =
   (unPackageName $ pkgName pkgid) ++ "-" ++
   (intercalate "." . map show . versionBranch . pkgVersion $ pkgid)
+
+
+constraintPkgName :: PackageConstraint -> PackageName
+constraintPkgName (PackageConstraintVersion   pn _) = pn
+constraintPkgName (PackageConstraintInstalled pn  ) = pn
+constraintPkgName (PackageConstraintSource    pn  ) = pn
+constraintPkgName (PackageConstraintFlags     pn _) = pn
+constraintPkgName (PackageConstraintStanzas   pn _) = pn
+
+
+installedIdtoDep :: InstalledPackageId -> Maybe Dependency
+installedIdtoDep (InstalledPackageId pid) = case parts of
+  (_:v:xs) -> Just $ Dependency
+                      (PackageName . intercalate "-" . reverse $ xs)
+                      (ThisVersion . fst . last . readP_to_S parseVersion $ v)
+  _        -> Nothing
+  where parts = reverse $ splitOn "-" pid
