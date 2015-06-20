@@ -123,37 +123,17 @@ isInstalledInstance _      = False
 mkSymConstraint :: VersionMappings -> Dependency -> SConstraint
 mkSymConstraint vms (Dependency pn vr) = mkConstraint vr
   where
-    -- TODO: clean up
-    mkConstraint AnyVersion             = const true
-    mkConstraint (ThisVersion v)        =
-      let xs = takeWhile ((== v) . getVersion . fst)
-             . dropWhile ((/= v) . getVersion . fst)
-             $ M.toList vts
-      in if null xs
-         then const false
-         else \s -> s .>= (snd $ head xs) &&& s .<= (snd $ last xs)
-    mkConstraint (LaterVersion v)       =
-      let xs = dropWhile ((<= v) . getVersion . fst) $ M.toList vts
-      in if null xs
-         then const false
-         else \s -> s .> (snd $ head xs)
-    mkConstraint (EarlierVersion v)     =
-      let xs = dropWhile ((<= v) . getVersion . fst) $ M.toList vts
-      in if null xs
-         then const false
-         else \s -> s .< (snd $ head xs)
-    mkConstraint vr'@(WildcardVersion _) =
-      let xs = takeWhile ((`withinRange` vr') . getVersion . fst)
-             . dropWhile ((not . (`withinRange` vr')) . getVersion . fst)
-             $ M.toList vts
-      in if null xs 
-         then const false
-         else \s -> s .>= (snd $ head xs) &&& s .<= (snd $ last xs)
     mkConstraint (UnionVersionRanges vr1 vr2) =
       \s -> mkConstraint vr1 s ||| mkConstraint vr2 s
     mkConstraint (IntersectVersionRanges vr1 vr2) =
       \s -> mkConstraint vr1 s &&& mkConstraint vr2 s
     mkConstraint (VersionRangeParens vr') = mkConstraint vr'
+    mkConstraint vr =
+      let vs = map snd
+             $ filter ((`withinRange` vr) . getVersion . fst) (M.toList vts)
+      in if null vs
+         then const false
+         else \s -> s .>= head vs &&& s .<= last vs
 
     -- TODO: fix fromJust
     (vts, _) = fromJust $ M.lookup pn vms
@@ -205,7 +185,6 @@ solveSMT targets pns nis pcs dcs = do
 
 
 -- TODO: - flags, stanzas, etc
---       - fix bugs
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
   sln <- solveSMT (S.fromList pns) allTargets nis pcs' dcs
@@ -225,12 +204,15 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
     toSConstraint :: PackageConstraint -> SConstraint
     toSConstraint (PackageConstraintVersion pn vr) =
       mkSymConstraint vms (Dependency pn vr)
-    toSConstraint (PackageConstraintInstalled pn) = (\s -> bAny ($ s) cs)
-      where cs = map ((.==) . snd)
-               . filter (isInstalledInstance . fst)
-               -- TODO: fromJust…
-               . M.toList . fst . fromJust $ M.lookup pn vms
+    toSConstraint (PackageConstraintInstalled pn) =
+      (\s -> bAny (.== s) (instancesBy isInstalledInstance pn))
+    toSConstraint (PackageConstraintSource pn) =
+      (\s -> bAny (.== s) (instancesBy isSourceInstance pn))
     toSConstraint _ = const true
+
+    instancesBy :: (InstanceVersion -> Bool) -> PackageName -> [SVersion]
+    instancesBy f pn = maybe [] (map snd . filter (f . fst). M.toList . fst)
+                                (M.lookup pn vms)
 
     dcs :: [[SDepConstraints]]
     dcs = map ( map (M.fromList
