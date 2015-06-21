@@ -15,7 +15,8 @@ module Distribution.Client.Dependency.ExternalSMT
     isSourceInstance,
     isInstalledInstance,
 
-    mkSymConstraint,
+    depToSConstraint,
+    pkgConstraintToSConstraint,
 
     externalSMTResolver,
 
@@ -120,8 +121,8 @@ isInstalledInstance (II _) = True
 isInstalledInstance _      = False
 
 
-mkSymConstraint :: VersionMappings -> Dependency -> SConstraint
-mkSymConstraint vms (Dependency pn vr) = mkConstraint vr
+depToSConstraint :: VersionMappings -> Dependency -> SConstraint
+depToSConstraint vms (Dependency pn vr) = mkConstraint vr
   where
     mkConstraint (UnionVersionRanges vr1 vr2) =
       \s -> mkConstraint vr1 s ||| mkConstraint vr2 s
@@ -137,6 +138,21 @@ mkSymConstraint vms (Dependency pn vr) = mkConstraint vr
 
     -- TODO: fix fromJust
     (vts, _) = fromJust $ M.lookup pn vms
+
+
+pkgConstraintToSConstraint :: VersionMappings -> PackageConstraint -> SConstraint
+pkgConstraintToSConstraint vms = mkConstraint
+  where
+    mkConstraint (PackageConstraintVersion pn vr) =
+      depToSConstraint vms (Dependency pn vr)
+    mkConstraint (PackageConstraintInstalled pn) =
+      \s -> bAny (.== s) (versionsBy isInstalledInstance pn)
+    mkConstraint (PackageConstraintSource pn) =
+      \s -> bAny (.== s) (versionsBy isSourceInstance pn)
+    mkConstraint _ = const true
+
+    versionsBy f pn = maybe [] (map snd . filter (f . fst) . M.toList . fst)
+                               (M.lookup pn vms)    
 
 
 -- | validate an install plan model
@@ -180,15 +196,14 @@ solveSMT targets pns nis pcs dcs = do
   --model <- maximize Quantified sum (length pns) (valid targets . mkSPkgs)
   --return $ maybe [] (zip pns) model
   where
-    mkSPkgs                = map (uncurry5 SPackage) . zip5 pns nis pcs dcs
-    uncurry5 f (a,b,c,d,e) = f a b c d e
+    mkSPkgs = zipWith5 SPackage pns nis pcs dcs
 
 
 -- TODO: - flags, stanzas, etc
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
   sln <- solveSMT (S.fromList pns) allTargets nis pcs' dcs
-  let sln' = toPackageIds vms $ filter ((/= 0) . snd) sln
+  let sln' = toPackageIds vms sln
   print $ map prettyPackageId sln'
   return $ Fail "not fully implemented yet"
   where
@@ -196,27 +211,16 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
     nis = map (fromIntegral . length . pkgInstances) allTargets
 
     pcs' :: [[SConstraint]]
-    pcs' = map (map toSConstraint . groupConstraints) allTargets
+    pcs' = map (map (pkgConstraintToSConstraint vms) . groupConstraints)
+               allTargets
 
     groupConstraints :: PackageName -> [PackageConstraint]
     groupConstraints pn = filter (\pc -> pn == constraintPkgName pc) pcs
 
-    toSConstraint :: PackageConstraint -> SConstraint
-    toSConstraint (PackageConstraintVersion pn vr) =
-      mkSymConstraint vms (Dependency pn vr)
-    toSConstraint (PackageConstraintInstalled pn) =
-      (\s -> bAny (.== s) (instancesBy isInstalledInstance pn))
-    toSConstraint (PackageConstraintSource pn) =
-      (\s -> bAny (.== s) (instancesBy isSourceInstance pn))
-    toSConstraint _ = const true
-
-    instancesBy :: (InstanceVersion -> Bool) -> PackageName -> [SVersion]
-    instancesBy f pn = maybe [] (map snd . filter (f . fst). M.toList . fst)
-                                (M.lookup pn vms)
 
     dcs :: [[SDepConstraints]]
     dcs = map ( map (M.fromList
-              . map (\d -> (depname d, [mkSymConstraint vms d])))
+              . map (\d -> (depname d, [depToSConstraint vms d])))
               . buildDeps ) allTargets
 
     vms :: VersionMappings
@@ -244,10 +248,9 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
                                     . PD.condTreeData )
                                     (PD.condLibrary $ packageDescription p)) )
                  . lookupPackageName sidx $ pn)
-                ++ map (\p -> (fst p, 
-                               concatMap (mapMaybe installedIdtoDep . depends)
-                               $ snd p) )
-                       (PI.lookupPackageName iidx pn) )
+                ++ map (\(v,p) ->
+                         (v, concatMap (mapMaybe installedIdtoDep . depends) p)
+                       ) (PI.lookupPackageName iidx pn) )
 
     depdfs :: S.Set PackageName -> [PackageName] -> S.Set PackageName
     depdfs visited [] = visited
@@ -259,12 +262,12 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
 
 
 toPackageIds :: VersionMappings -> [ResolvedInstance] -> [PackageIdentifier]
-toPackageIds vms = map toPkgId
+toPackageIds vms = mapMaybe toPkgId
   where
-    -- TODO: fix this
-    toPkgId (pn,sv) = let (_, stv) = fromJust $ M.lookup pn vms
-                          ver      = getVersion $ fromJust $ M.lookup sv stv
-                      in PackageIdentifier pn ver
+    toPkgId (pn,sv) = do
+      (_, stv) <- M.lookup pn vms
+      ver      <- getVersion <$> M.lookup sv stv
+      return $ PackageIdentifier pn ver
 
 
 prettyPackageId :: PackageIdentifier -> String
@@ -288,3 +291,4 @@ installedIdtoDep (InstalledPackageId pid) = case parts of
                       (ThisVersion . fst . last . readP_to_S parseVersion $ v)
   _        -> Nothing
   where parts = reverse $ splitOn "-" pid
+  
