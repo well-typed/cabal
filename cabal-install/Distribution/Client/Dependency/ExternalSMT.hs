@@ -73,8 +73,11 @@ import Debug.Trace (trace)
 -- | symbolic package version
 type SVersion = SWord32
 
+-- | selected package version
+type SMTVersion = Word32
+
 -- | resolved package instance
-type ResolvedInstance = (PackageName, Word32)
+type ResolvedInstance = (PackageName, SMTVersion)
 
 -- | symbolic package instance constraints
 type SConstraint = SVersion -> SBool
@@ -90,8 +93,16 @@ data SPackage = SPackage {
 }
 
 
+-- | Maps Cabal versions to SMT solver versions.
+--
+-- TODO: I think this should map to SMTVersion rather than SVersion.
 type VersionSymbolMap = M.Map InstanceVersion SVersion
-type SymbolVersionMap = M.Map Word32 InstanceVersion
+
+-- | Maps SMT solver versions to Cabal versions.
+type SymbolVersionMap = M.Map SMTVersion InstanceVersion
+
+-- | For each package, contains maps relating Cabal versions
+-- and SMT solver versions to each other.
 type VersionMappings  = M.Map PackageName (VersionSymbolMap, SymbolVersionMap)
 
 
@@ -156,24 +167,40 @@ pkgConstraintToSConstraint vms = mkConstraint
                                (M.lookup pn vms)    
 
 
--- | validate an install plan model
-valid :: S.Set PackageName -> [SPackage] -> SBool
+-- | Generates the constraints that describe what constitutes a valid
+-- install plan.
+valid :: S.Set PackageName   -- ^ the target packages (from the command line)
+      -> [SPackage]          -- ^ all relevant packages (contains the variables)
+      -> SBool
 valid targets spkgs = bAll checkPkg spkgs
   where
+    -- Generates the constraints for one individual package.
+    --
+    -- In particular, if a package is among the targets, then the solver
+    -- must choose a version for it (it may choose an installed version).
     checkPkg (SPackage pn ni pcs _ ver)
       | pn `S.member` targets = ver ./= 0 &&& validPkg pn ni pcs ver
-      | otherwise             = isNeeded pn ver &&& validPkg pn ni pcs ver
+      | otherwise             =               validPkg pn ni pcs ver
+
+    -- Further per-package constraints.
+    --
+    -- For each package, we generate, the following constraints:
+    --
+    --   * The version must be in the range of the available versions.
+    --     If n instances of the package are available, the value of the
+    --     package variable must be between 0 (which means ignore) and n.
+    --     (TODO: Why not do this separately?)
+    --
+    --   * If there are input constraints for this package, we'll
+    --     generate them. (TODO: Why not do this separately?)
+    --
     validPkg pn ni pcs ver = rangeFine ni ver
                          &&& checkConstraints ver pcs
-                         &&& checkDepConstraints pn ver
+                    --     &&& checkDepConstraints pn ver
+
+    -- Checks that a given package instance is in allowed range.
     rangeFine ni ver = ver .>= 0 &&& ver .<= ni
     checkConstraints ver cs = bAll ($ ver) cs
-    isNeeded pn ver = ite (bAny (requires pn ver) spkgs) (ver ./= 0) (ver .== 0)
-    requires pn ver (SPackage _ _ _ dcs ver') =
-      ver' ./= 0 &&&
-      bOr (zipWith (\v dcs' -> v .== ver' &&&
-                     if pn `M.member` dcs' then true else false
-                   ) [1..] dcs)
     checkDepConstraints pn ver = bAll (checkPkgDepConstraints pn ver) spkgs
     checkPkgDepConstraints pn ver (SPackage _ _ _ dcs ver') =
       ver' .== 0 |||
@@ -199,45 +226,97 @@ solveSMT targets pns nis pcs dcs = do
   where
     mkSPkgs = zipWith5 SPackage pns nis pcs dcs
 
-
+-- | This is the entry point for the external SMT solver.
+--
+-- Its type is dictated by the generic cabal-install solver interface.
+-- What we do here is to pre-analyze the data we have available and turn
+-- it into the format that is needed so that we can the SMT solver.
+--
 -- TODO: - flags, stanzas, etc
+--
+-- TODO: reverse translate the output of the SMT solver into what is
+-- actually expected by the rest of cabal-install.
+--
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
   sln <- solveSMT (S.fromList pns) allTargets nis pcs' dcs
+
+  -- From the solver, we get a model.
+  --
+  -- At this point, 'sln' is a mapping from package variable names to
+  -- selected versions (using the numbering exposed to the SMT solver).
+  --
+  -- We have to translate the selected versions back into actual
+  -- package instances. The map 'vms' contains the necessary mapping
+  -- between Cabal versions and SMT solver versions.
   let sln' = toPackageIds vms sln
+
+  -- For now, we then simply print the selected versions ...
   print $ map prettyPackageId sln'
+  -- ... and always fail.
   return $ Fail "not fully implemented yet"
   where
+
+    -- This is the list of all relevant packages.
+    --
+    -- TODO: This is misnamed. These aren't "targets".
+    --
+    -- It's computed by traversing the package index and simply including all
+    -- packages that could possibly occur as dependencies. The starting point
+    -- are the actual targets, i.e., the usually user-specified packages.
+    --
+    allTargets :: [PackageName]
+    allTargets = S.toList $ depdfs S.empty pns
+
+    -- For all packages, compute the number of instances that are available.
+    --
+    -- TODO: Why is this not directly attached to each individual package?
+    -- Why does it not reuse the version map?
     nis :: [SWord32]
     nis = map (fromIntegral . length . pkgInstances) allTargets
 
+    -- For a given package name, determines the list of all available
+    -- instances, in ascending order. Looks up both installed and source
+    -- packages from their respective package indexes.
+    pkgInstances :: PackageName -> [InstanceVersion]
+    pkgInstances pn = sort $ map (II . fst) (PI.lookupPackageName iidx pn)
+                          ++ map (SI . packageVersion) (lookupPackageName sidx pn)
+
+    -- Translates the incoming package constraints into symbolic
+    -- constraints.
+    --
+    -- TODO: It's unclear what we do all the grouping for. I think it
+    -- is because we do not have the variables available at this point.
+    -- But this should be solved differently.
     pcs' :: [[SConstraint]]
     pcs' = map (map (pkgConstraintToSConstraint vms) . groupConstraints)
                allTargets
 
+    -- TODO: Quite inefficient grouping function.
     groupConstraints :: PackageName -> [PackageConstraint]
     groupConstraints pn = filter (\pc -> pn == constraintPkgName pc) pcs
-
 
     dcs :: [[SDepConstraints]]
     dcs = map ( map (M.fromList
               . map (\d -> (depname d, [depToSConstraint vms d])))
               . buildDeps ) allTargets
 
+
     vms :: VersionMappings
     vms = M.fromList
         $ zip allTargets
         $ map (mkVersionMaps . pkgInstances) allTargets
 
-    allTargets :: [PackageName]
-    allTargets = S.toList $ depdfs S.empty pns
-
-    depname (Dependency pkgname _) = pkgname
-
+    -- Helper function that creates the actual version associations.
+    mkVersionMaps :: [InstanceVersion] -> (VersionSymbolMap, SymbolVersionMap)
     mkVersionMaps vs = (M.fromList $ zip vs [1..], M.fromList $ zip [1..] vs)
 
-    pkgInstances pn = sort $ map (II . fst) (PI.lookupPackageName iidx pn)
-                          ++ map (SI . packageVersion) (lookupPackageName sidx pn)
+    -- Extracts the package name from a dependency.
+    --
+    -- TODO: This looks like a general purpose function, or one
+    -- that could be inlined.
+    depname :: Dependency -> PackageName
+    depname (Dependency pkgname _) = pkgname
 
     buildDeps :: PackageName -> [[Dependency]]
     buildDeps pn = map snd
