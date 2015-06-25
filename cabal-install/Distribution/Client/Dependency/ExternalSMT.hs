@@ -28,6 +28,7 @@ module Distribution.Client.Dependency.ExternalSMT
   ) where
 
 
+import Control.Applicative ((<$>))
 import Distribution.Client.Dependency.Modular.Solver
   ( SolverConfig(..) )
 import Distribution.Client.Dependency.Types
@@ -291,4 +292,3 @@ installedIdtoDep (InstalledPackageId pid) = case parts of
                       (ThisVersion . fst . last . readP_to_S parseVersion $ v)
   _        -> Nothing
   where parts = reverse $ splitOn "-" pid
-  
