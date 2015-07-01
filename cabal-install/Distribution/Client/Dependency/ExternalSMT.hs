@@ -43,7 +43,7 @@ import qualified Distribution.PackageDescription as PD
     Library(..),
     BuildInfo(..),
     CondTree(..) )
-import qualified Distribution.Simple.PackageIndex as PI
+import qualified Distribution.Simple.PackageIndex as IPI
 import Distribution.InstalledPackageInfo
   ( InstalledPackageInfo_(..) )
 import Distribution.Package
@@ -52,8 +52,7 @@ import Distribution.Package
       PackageIdentifier(..),
       InstalledPackageId(..),
       packageVersion )
-import Distribution.Client.PackageIndex
-  ( lookupPackageName )
+import qualified Distribution.Client.PackageIndex as SPI
 import Distribution.Version
 import Data.Version ( parseVersion )
 
@@ -189,10 +188,15 @@ valid targets spkgs = bAll checkPkg spkgs
     --   * The version must be in the range of the available versions.
     --     If n instances of the package are available, the value of the
     --     package variable must be between 0 (which means ignore) and n.
-    --     (TODO: Why not do this separately?)
     --
     --   * If there are input constraints for this package, we'll
-    --     generate them. (TODO: Why not do this separately?)
+    --     generate them. (TODO: I'd prefer to do this in a separate
+    --     pass, as these are problem-specific (to the individual solver
+    --     invocation), whereas typically the layout of the dependencies
+    --     is more global. It's a minor point though.)
+    --
+    --   * Reflect the dependencies of the package as constraints on
+    --     other variables.
     --
     validPkg pn ni pcs ver = rangeFine ni ver
                          &&& checkConstraints ver pcs
@@ -237,6 +241,19 @@ solveSMT targets pns nis pcs dcs = do
 -- TODO: reverse translate the output of the SMT solver into what is
 -- actually expected by the rest of cabal-install.
 --
+-- TODO: The style of this function is suboptimal. We're computing
+-- a lot of different lists for solveSMT, namely allTargets, nis,
+-- pcs', dcs, only to then zip them together. Why don't we produce
+-- a single list in the first place? If we look at nis, pcs' and
+-- dcs, then all three are just maps over allTargets. So rather than
+-- doing three separate maps over allTargets with a subsequent zip,
+-- let's just do a single map over allTargets. I.e., write functions,
+-- ideally on the top level, that for a single package compute the
+-- number of available instances, the package constraints, and the
+-- dependency constraints. Then call SPackage (per package). We can
+-- feed the [SVersion -> SPackage] to solveSMT, and everything will
+-- be a bit more direct.
+--
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
   sln <- solveSMT (S.fromList pns) allTargets nis pcs' dcs
@@ -268,6 +285,28 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
     allTargets :: [PackageName]
     allTargets = S.toList $ depdfs S.empty pns
 
+    buildDeps :: PackageName -> [[Dependency]]
+    buildDeps pn = map snd
+                 . sortBy (compare `on` fst)
+                 $ ((map (\p -> (packageVersion (packageDescription p),
+                              maybe []
+                                    ( PD.targetBuildDepends
+                                    . PD.libBuildInfo
+                                    . PD.condTreeData )
+                                    (PD.condLibrary $ packageDescription p)) )
+                 . SPI.lookupPackageName sidx $ pn)
+                ++ map (\(v,p) ->
+                         (v, concatMap (mapMaybe installedIdtoDep . depends) p)
+                       ) (IPI.lookupPackageName iidx pn) )
+
+    depdfs :: S.Set PackageName -> [PackageName] -> S.Set PackageName
+    depdfs visited [] = visited
+    depdfs visited (x:xs)
+      | x `S.member` visited = depdfs visited xs
+      | otherwise            = depdfs (S.insert x visited) (xs ++ childdeps)
+      where
+        childdeps = concatMap (map (\ (Dependency pkgname _) -> pkgname)) (buildDeps x)
+
     -- For all packages, compute the number of instances that are available.
     --
     -- TODO: Why is this not directly attached to each individual package?
@@ -279,8 +318,8 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
     -- instances, in ascending order. Looks up both installed and source
     -- packages from their respective package indexes.
     pkgInstances :: PackageName -> [InstanceVersion]
-    pkgInstances pn = sort $ map (II . fst) (PI.lookupPackageName iidx pn)
-                          ++ map (SI . packageVersion) (lookupPackageName sidx pn)
+    pkgInstances pn = sort $ map (II . fst) (IPI.lookupPackageName iidx pn)
+                          ++ map (SI . packageVersion) (SPI.lookupPackageName sidx pn)
 
     -- Translates the incoming package constraints into symbolic
     -- constraints.
@@ -298,7 +337,7 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
 
     dcs :: [[SDepConstraints]]
     dcs = map ( map (M.fromList
-              . map (\d -> (depname d, [depToSConstraint vms d])))
+              . map (\d @ (Dependency pkgname _) -> (pkgname, [depToSConstraint vms d])))
               . buildDeps ) allTargets
 
 
@@ -311,35 +350,10 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
     mkVersionMaps :: [InstanceVersion] -> (VersionSymbolMap, SymbolVersionMap)
     mkVersionMaps vs = (M.fromList $ zip vs [1..], M.fromList $ zip [1..] vs)
 
-    -- Extracts the package name from a dependency.
-    --
-    -- TODO: This looks like a general purpose function, or one
-    -- that could be inlined.
-    depname :: Dependency -> PackageName
-    depname (Dependency pkgname _) = pkgname
 
-    buildDeps :: PackageName -> [[Dependency]]
-    buildDeps pn = map snd
-                 . sortBy (compare `on` fst)
-                 $ ((map (\p -> (packageVersion (packageDescription p),
-                              maybe []
-                                    ( PD.targetBuildDepends
-                                    . PD.libBuildInfo
-                                    . PD.condTreeData )
-                                    (PD.condLibrary $ packageDescription p)) )
-                 . lookupPackageName sidx $ pn)
-                ++ map (\(v,p) ->
-                         (v, concatMap (mapMaybe installedIdtoDep . depends) p)
-                       ) (PI.lookupPackageName iidx pn) )
-
-    depdfs :: S.Set PackageName -> [PackageName] -> S.Set PackageName
-    depdfs visited [] = visited
-    depdfs visited (x:xs)
-      | x `S.member` visited = depdfs visited xs
-      | otherwise            = depdfs (S.insert x visited) (xs ++ childdeps)
-      where
-        childdeps = concatMap (map depname) (buildDeps x)
-
+pkgInstances :: PackageName -> IPI.InstalledPackageIndex -> SPI.PackageIndex SourcePackage -> [InstanceVersion]
+pkgInstances pn iidx sidx = sort $ map (II . fst) (IPI.lookupPackageName iidx pn)
+                                ++ map (SI . packageVersion) (SPI.lookupPackageName sidx pn)
 
 toPackageIds :: VersionMappings -> [ResolvedInstance] -> [PackageIdentifier]
 toPackageIds vms = mapMaybe toPkgId
