@@ -85,7 +85,7 @@ type SDepConstraints = M.Map PackageName [SConstraint]
 
 data SPackage = SPackage {
   spkgNumInstances    :: SWord32,
-  spkgFDeps           :: [[FlaggedDep]],
+  spkgFDeps           :: [([PD.FlagName],[FlaggedDep])],
   spkgSVersion        :: SVersion
 }
 
@@ -197,35 +197,40 @@ pkgConstraintToSConstraint vms = mkConstraint
 
 
 -- | validate an install plan model
-valid :: S.Set PackageName
-      -> VersionMappings
-      -> [(PackageName,SConstraint)]
-      -> M.Map PackageName SPackage
-      -> SBool
-valid targets vms pcs spkgs = bAll checkPkgConstraint pcs
-                          &&& bAll checkPkg (M.toList spkgs)
+validateModel :: S.Set PackageName
+              -> VersionMappings
+              -> [(PackageName,SConstraint)]
+              -> M.Map PackageName SPackage
+              -> Symbolic SBool
+validateModel targets vms pcs spkgs = (bAll checkPkgConstraint pcs &&&) . bAnd
+                                  <$> mapM checkPkg (M.toList spkgs)
   where
     checkPkgConstraint (pn, c) = c . spkgSVersion . fromJust $ M.lookup pn spkgs
 
     checkPkg (pn, SPackage ni fdeps ver)
-      | pn `S.member` targets = ver ./= 0 &&& validPkg ni fdeps ver
-      | otherwise             = ver .== 0 ||| validPkg ni fdeps ver
+      | pn `S.member` targets = (ver ./= 0 &&&) <$> validPkg ni fdeps ver
+      | otherwise             = (ver .== 0 |||) <$> validPkg ni fdeps ver
 
-    validPkg ni fdeps ver = checkVersionRange ni ver
-                        &&& checkDepConstraints ver fdeps
+    validPkg ni fdeps ver = (checkVersionRange ni ver &&&)
+                        <$> checkDepConstraints ver fdeps
 
     checkVersionRange ni ver = ver .>= 0 &&& ver .<= ni
 
     checkDepConstraints ver fdeps =
-      bAny (\(v, fdeps') -> v .== ver &&& checkAllDeps fdeps') (zip [1..] fdeps)
+      bOr <$> mapM (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fns fdeps'
+                                      <$> mkExistVars (length fns) )
+                   (zip [1..] fdeps)
 
-    checkAllDeps fdeps = bAll checkDependency fdeps
+    checkAllDeps fns fdeps sflags = bAll (checkDependency fns sflags) fdeps
 
-    checkDependency (Simple d@(Dependency pn _)) =
+    checkDependency fns sflags (Simple d@(Dependency pn _)) =
       maybe false
             (\(SPackage _ _ v) -> v ./=0 &&& depToSConstraint vms d v)
             (M.lookup pn spkgs)
-    checkDependency (Flagged _ t f) = checkAllDeps t ||| checkAllDeps f
+    checkDependency fns sflags (Flagged fn t f) =
+      ite (sflags !! fromJust (elemIndex fn fns))
+          (checkAllDeps fns t sflags)
+          (checkAllDeps fns f sflags)
 
 
 solveSMT :: S.Set PackageName
@@ -233,11 +238,11 @@ solveSMT :: S.Set PackageName
          -> [PackageName]
          -> [SWord32]
          -> [(PackageName,SConstraint)]
-         -> [[[FlaggedDep]]]
+         -> [[([PD.FlagName],[FlaggedDep])]]
          -> IO [ResolvedInstance]
 solveSMT targets vms pns nis pcs fdeps = do
-  model <- getModel <$> satWith cfg ( (valid targets vms pcs . mkSPkgs) <$>
-                              mkExistVars (length pns) )
+  model <- getModel <$> satWith cfg ( mkExistVars (length pns) >>=
+                                      validateModel targets vms pcs . mkSPkgs )
   case model of
     Right (_, sln) -> return $ zip pns sln
     Left  m        -> return []
@@ -272,7 +277,7 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
     pcs' :: [(PackageName,SConstraint)]
     pcs' = map (\c -> (constraintPkgName c, pkgConstraintToSConstraint vms c)) pcs
 
-    fdeps :: [[[FlaggedDep]]]
+    fdeps :: [[([PD.FlagName],[FlaggedDep])]]
     fdeps = map buildDeps candidatePackages
 
     vms :: VersionMappings
@@ -294,19 +299,22 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
                     (PI.lookupPackageName iidx pn)
         sourceInstances = map (SI . packageVersion) (lookupPackageName sidx pn)
 
-    buildDeps :: PackageName -> [[FlaggedDep]]
+    buildDeps :: PackageName -> [([PD.FlagName],[FlaggedDep])]
     buildDeps pn = map snd . sortBy (compare `on` fst)
                  $ sourceDeps ++ installedDeps
       where
         sourceDeps =
-          map (\p -> (packageVersion (packageDescription p),
-                      maybe []
-                            (flaggedDeps os arch cinfo)
-                            (PD.condLibrary $ packageDescription p))
+          map (\p -> let pd = packageDescription p in
+                     (packageVersion pd,
+                       (map PD.flagName $ PD.genPackageFlags pd,
+                        maybe []
+                              (flaggedDeps os arch cinfo)
+                              (PD.condLibrary pd))
+                     )
               ) (lookupPackageName sidx pn)
         installedDeps =
           map (\(v,p) ->
-                (v, concatMap (map Simple . mapMaybe installedIdtoDep . depends) p)
+                (v, ([], concatMap (map Simple . mapMaybe installedIdtoDep . depends) p))
               ) (PI.lookupPackageName iidx pn) 
 
     depdfs :: S.Set PackageName -> [PackageName] -> S.Set PackageName
@@ -315,7 +323,7 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
       | x `S.member` visited = depdfs visited xs
       | otherwise            = depdfs (S.insert x visited) (xs ++ childdeps)
       where
-        childdeps = concatMap (concatMap fdepnames) (buildDeps x)
+        childdeps = concatMap (concatMap fdepnames . snd) (buildDeps x)
         fdepnames (Simple (Dependency pn _)) = [pn]
         fdepnames (Flagged _ t f           ) = concatMap fdepnames (t ++ f)
 
