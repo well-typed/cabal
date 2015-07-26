@@ -217,20 +217,21 @@ validateModel targets vms pcs spkgs = (bAll checkPkgConstraint pcs &&&) . bAnd
     checkVersionRange ni ver = ver .>= 0 &&& ver .<= ni
 
     checkDepConstraints ver fdeps =
-      bOr <$> mapM (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fns fdeps'
+      bOr <$> mapM (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fdeps'
+                                        . M.fromList . zip fns
                                       <$> mkExistVars (length fns) )
                    (zip [1..] fdeps)
 
-    checkAllDeps fns fdeps sflags = bAll (checkDependency fns sflags) fdeps
+    checkAllDeps fdeps sflags = bAll (checkDependency sflags) fdeps
 
-    checkDependency fns sflags (Simple d@(Dependency pn _)) =
+    checkDependency sflags (Simple d@(Dependency pn _)) =
       maybe false
             (\(SPackage _ _ v) -> v ./=0 &&& depToSConstraint vms d v)
             (M.lookup pn spkgs)
-    checkDependency fns sflags (Flagged fn t f) =
-      ite (sflags !! fromJust (elemIndex fn fns))
-          (checkAllDeps fns t sflags)
-          (checkAllDeps fns f sflags)
+    checkDependency sflags (Flagged fn t f) =
+      ite (fromJust $ M.lookup fn sflags)
+          (checkAllDeps t sflags)
+          (checkAllDeps f sflags)
 
 
 solveSMT :: S.Set PackageName
