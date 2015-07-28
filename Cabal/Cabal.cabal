@@ -237,6 +237,7 @@ library
     Distribution.Compat.CopyFile
     Distribution.Compat.TempFile
     Distribution.GetOpt
+    Distribution.Lex
     Distribution.Simple.GHC.Internal
     Distribution.Simple.GHC.IPI641
     Distribution.Simple.GHC.IPI642
@@ -266,6 +267,7 @@ test-suite unit-tests
     tasty,
     tasty-hunit,
     tasty-quickcheck,
+    pretty,
     QuickCheck < 2.9,
     Cabal
   ghc-options: -Wall
@@ -306,6 +308,9 @@ test-suite package-tests
     PackageTests.TestOptions.Check
     PackageTests.TestStanza.Check
     PackageTests.TestSuiteExeV10.Check
+    Test.Distribution.Version
+    Test.Laws
+    Test.QuickCheck.Utils
   hs-source-dirs: tests
   build-depends:
     base,

@@ -74,7 +74,7 @@ To build and test the `Cabal` library, do:
     for example with:
 
     ~~~~
-    cabal exec -- sh -c "echo \$GHC_PACKAGE_PATH" | sed s/:.*//
+    cabal exec -- sh -c "echo \$GHC_PACKAGE_PATH" | sed 's/:.*//'
     ~~~~
 
     the result should be something like
@@ -115,7 +115,7 @@ identical; only the first two steps are different:
     ~~~~
     cabal sandbox init
     cabal sandbox add-source ../Cabal/
-    cabal install --only-dependencies
+    cabal install --only-dependencies --enable-tests
     ~~~~
 
 (In addition, the absolute sandbox path will be slightly different

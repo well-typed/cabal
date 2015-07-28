@@ -190,9 +190,12 @@ checkSanity pkg =
   , check (null . versionBranch . packageVersion $ pkg) $
       PackageBuildImpossible "No 'version' field."
 
-  , check (null (executables pkg) && isNothing (library pkg)) $
+  , check (all ($ pkg) [ null . executables
+                       , null . testSuites
+                       , null . benchmarks
+                       , isNothing . library ]) $
       PackageBuildImpossible
-        "No executables and no library found. Nothing to do."
+        "No executables, libraries, tests, or benchmarks found. Nothing to do."
 
   , check (not (null duplicateNames)) $
       PackageBuildImpossible $ "Duplicate sections: " ++ commaSep duplicateNames
@@ -1076,7 +1079,7 @@ checkCabalVersion pkg =
   , check (specVersion pkg < Version [1,23] []
            && isNothing (setupBuildInfo pkg)
            && buildType pkg == Just Custom) $
-      PackageBuildWarning $
+      PackageDistSuspicious $
            "From version 1.23 cabal supports specifiying explicit dependencies "
         ++ "for Custom setup scripts. Consider using cabal-version >= 1.23 and "
         ++ "adding a 'custom-setup' section with a 'setup-depends' field "
@@ -1579,10 +1582,11 @@ checkLicensesExist ops pkg = do
 checkSetupExists :: Monad m => CheckPackageContentOps m
                  -> PackageDescription
                  -> m (Maybe PackageCheck)
-checkSetupExists ops _ = do
+checkSetupExists ops pkg = do
+  let simpleBuild = buildType pkg == Just Simple
   hsexists  <- doesFileExist ops "Setup.hs"
   lhsexists <- doesFileExist ops "Setup.lhs"
-  return $ check (not hsexists && not lhsexists) $
+  return $ check (not simpleBuild && not hsexists && not lhsexists) $
     PackageDistInexcusable $
       "The package is missing a Setup.hs or Setup.lhs script."
 

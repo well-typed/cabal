@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE PatternGuards #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple.GHC.Internal
@@ -24,12 +25,14 @@ module Distribution.Simple.GHC.Internal (
         getHaskellObjects,
         mkGhcOptPackages,
         substTopDir,
-        checkPackageDbEnvVar
+        checkPackageDbEnvVar,
+        profDetailLevelFlag,
  ) where
 
 import Distribution.Simple.GHC.ImplInfo ( GhcImplInfo (..) )
 import Distribution.Package
-         ( InstalledPackageId, PackageId )
+         ( InstalledPackageId, PackageId, LibraryName
+         , getHSLibraryName )
 import Distribution.InstalledPackageInfo
          ( InstalledPackageInfo )
 import qualified Distribution.InstalledPackageInfo as InstalledPackageInfo
@@ -38,11 +41,13 @@ import Distribution.PackageDescription as PD
          ( BuildInfo(..), Library(..), libModules
          , hcOptions, usedExtensions, ModuleRenaming, lookupRenaming )
 import Distribution.Compat.Exception ( catchExit, catchIO )
+import Distribution.Lex (tokenizeQuotedWords)
 import Distribution.Simple.Compiler
-         ( CompilerFlavor(..), Compiler(..), DebugInfoLevel(..), OptimisationLevel(..) )
+         ( CompilerFlavor(..), Compiler(..), DebugInfoLevel(..)
+         , OptimisationLevel(..), ProfDetailLevel(..) )
 import Distribution.Simple.Program.GHC
 import Distribution.Simple.Setup
-         ( toFlag )
+         ( Flag, toFlag )
 import qualified Distribution.ModuleName as ModuleName
 import Distribution.Simple.Program
          ( Program(..), ConfiguredProgram(..), ProgramConfiguration
@@ -52,8 +57,7 @@ import Distribution.Simple.Program
          , getProgramOutput )
 import Distribution.Simple.Program.Types ( suppressOverrideArgs )
 import Distribution.Simple.LocalBuildInfo
-         ( LocalBuildInfo(..), ComponentLocalBuildInfo(..)
-         , LibraryName(..) )
+         ( LocalBuildInfo(..), ComponentLocalBuildInfo(..) )
 import Distribution.Simple.Utils
 import Distribution.Simple.BuildPaths
 import Distribution.System ( buildOS, OS(..), Platform, platformFromTriple )
@@ -146,12 +150,19 @@ configureToolchain implInfo ghcProg ghcInfo =
     gccLinkerFlags = getFlags "Gcc Linker flags"
     ldLinkerFlags  = getFlags "Ld Linker flags"
 
-    getFlags key = case M.lookup key ghcInfo of
-                   Nothing -> []
-                   Just flags ->
-                       case reads flags of
-                       [(args, "")] -> args
-                       _ -> [] -- XXX Should should be an error really
+    -- It appears that GHC 7.6 and earlier encode the tokenized flags as a
+    -- [String] in these settings whereas later versions just encode the flags as
+    -- String.
+    --
+    -- We first try to parse as a [String] and if this fails then tokenize the
+    -- flags ourself.
+    getFlags :: String -> [String]
+    getFlags key =
+        case M.lookup key ghcInfo of
+          Nothing -> []
+          Just flags
+            | (flags', ""):_ <- reads flags -> flags'
+            | otherwise -> tokenizeQuotedWords flags
 
     configureGcc :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
     configureGcc v gccProg = do
@@ -335,7 +346,9 @@ componentCcGhcOptions verbosity implInfo lbi bi clbi pref filename =
       ghcOptInputFiles     = toNubListR [filename],
 
       ghcOptCppIncludePath = toNubListR $ [autogenModulesDir lbi, odir]
-                                          ++ PD.includeDirs bi,
+                                          ++ PD.includeDirs bi
+                                          ++ ["/System/Library/Frameworks/"++fw++"/Headers"
+                                              | isOSX, fw <- PD.frameworks bi ],
       ghcOptPackageDBs     = withPackageDB lbi,
       ghcOptPackages       = toNubListR $ mkGhcOptPackages clbi,
       ghcOptCcOptions      = toNubListR $
@@ -351,6 +364,7 @@ componentCcGhcOptions verbosity implInfo lbi bi clbi pref filename =
       ghcOptObjDir         = toFlag odir
     }
   where
+    isOSX = case buildOS of OSX -> True; _ -> False
     odir | hasCcOdirBug implInfo = pref </> takeDirectory filename
          | otherwise             = pref
          -- ghc 6.4.0 had a bug in -odir handling for C compilations.
@@ -363,6 +377,10 @@ componentGhcOptions verbosity lbi bi clbi odir =
       ghcOptVerbosity       = toFlag verbosity,
       ghcOptHideAllPackages = toFlag True,
       ghcOptCabal           = toFlag True,
+      ghcOptPackageKey  = case clbi of
+        LibComponentLocalBuildInfo { componentPackageKey = pk } -> toFlag pk
+        _ -> mempty,
+      ghcOptSigOf           = hole_insts,
       ghcOptPackageDBs      = withPackageDB lbi,
       ghcOptPackages        = toNubListR $ mkGhcOptPackages clbi,
       ghcOptSplitObjs       = toFlag (splitObjs lbi),
@@ -370,7 +388,9 @@ componentGhcOptions verbosity lbi bi clbi odir =
       ghcOptSourcePath      = toNubListR $ [odir] ++ (hsSourceDirs bi)
                                            ++ [autogenModulesDir lbi],
       ghcOptCppIncludePath  = toNubListR $ [autogenModulesDir lbi, odir]
-                                           ++ PD.includeDirs bi,
+                                           ++ PD.includeDirs bi
+                                           ++ ["/System/Library/Frameworks/"++fw++"/Headers"
+                                               | isOSX, fw <- PD.frameworks bi ],
       ghcOptCppOptions      = toNubListR $ cppOptions bi,
       ghcOptCppIncludes     = toNubListR $
                               [autogenModulesDir lbi </> cppHeaderName],
@@ -388,6 +408,8 @@ componentGhcOptions verbosity lbi bi clbi odir =
       ghcOptExtensionMap    = M.fromList . compilerExtensions $ (compiler lbi)
     }
   where
+    isOSX = case buildOS of OSX -> True; _ -> False
+
     toGhcOptimisation NoOptimisation      = mempty --TODO perhaps override?
     toGhcOptimisation NormalOptimisation  = toFlag GhcNormalOptimisation
     toGhcOptimisation MaximumOptimisation = toFlag GhcMaximumOptimisation
@@ -397,6 +419,9 @@ componentGhcOptions verbosity lbi bi clbi odir =
     toGhcDebugInfo MinimalDebugInfo = toFlag True
     toGhcDebugInfo NormalDebugInfo  = toFlag True
     toGhcDebugInfo MaximalDebugInfo = toFlag True
+
+    hole_insts = map (\(k,(p,n)) -> (k, (InstalledPackageInfo.packageKey p,n)))
+                 (instantiatedWith lbi)
 
 -- | Strip out flags that are not supported in ghci
 filterGhciFlags :: [String] -> [String]
@@ -412,7 +437,7 @@ filterGhciFlags = filter supported
     supported _           = True
 
 mkGHCiLibName :: LibraryName -> String
-mkGHCiLibName (LibraryName lib) = lib <.> "o"
+mkGHCiLibName lib = getHSLibraryName lib <.> "o"
 
 ghcLookupProperty :: String -> Compiler -> Bool
 ghcLookupProperty prop comp =
@@ -490,3 +515,14 @@ checkPackageDbEnvVar compilerName packagePathEnvVar = do
                ++ packagePathEnvVar ++ " is incompatible with Cabal. Use the "
                ++ "flag --package-db to specify a package database (it can be "
                ++ "used multiple times)."
+
+profDetailLevelFlag :: Bool -> ProfDetailLevel -> Flag GhcProfAuto
+profDetailLevelFlag forLib mpl =
+    case mpl of
+      ProfDetailNone                -> mempty
+      ProfDetailDefault | forLib    -> toFlag GhcProfAutoExported
+                        | otherwise -> toFlag GhcProfAutoToplevel
+      ProfDetailExportedFunctions   -> toFlag GhcProfAutoExported
+      ProfDetailToplevelFunctions   -> toFlag GhcProfAutoToplevel
+      ProfDetailAllFunctions        -> toFlag GhcProfAutoAll
+      ProfDetailOther _             -> mempty
