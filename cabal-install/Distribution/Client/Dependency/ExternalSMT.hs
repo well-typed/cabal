@@ -209,25 +209,32 @@ validateModel :: S.Set PackageName
 validateModel targets vms pcs spkgs = (bAll checkPkgConstraint pcs &&&) . bAnd
                                   <$> mapM checkPkg (M.toList spkgs)
   where
+    checkPkgConstraint :: (PackageName, SConstraint) -> SBool
     checkPkgConstraint (pn, c) = c . spkgSVersion . fromJust $ M.lookup pn spkgs
 
+    checkPkg :: (PackageName, SPackage) -> Symbolic SBool
     checkPkg (pn, SPackage ni fdeps ver)
       | pn `S.member` targets = (ver ./= 0 &&&) <$> validPkg pn ni fdeps ver
       | otherwise             = (ver .== 0 |||) <$> validPkg pn ni fdeps ver
 
+    validPkg :: PackageName -> SWord32 -> [([PD.FlagName], [FlaggedDep])] -> SVersion -> Symbolic SBool
     validPkg pn ni fdeps ver = (checkVersionRange ni ver &&&)
                            <$> checkDepConstraints pn ver fdeps
 
+    checkVersionRange :: SWord32 -> SVersion -> SBool
     checkVersionRange ni ver = ver .>= 0 &&& ver .<= ni
 
+    checkDepConstraints :: PackageName -> SVersion -> [([PD.FlagName], [FlaggedDep])] -> Symbolic SBool
     checkDepConstraints pn ver fdeps =
       bOr <$> mapM (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fdeps'
                                         . M.fromList . zip fns
                                       <$> mkExistentials (map (\ f -> unPackageName pn ++ ":" ++ unFlagName f) fns) )
                    (zip [1..] fdeps)
 
+    checkAllDeps :: [FlaggedDep] -> M.Map PD.FlagName SBool -> SBool
     checkAllDeps fdeps sflags = bAll (checkDependency sflags) fdeps
 
+    checkDependency :: M.Map PD.FlagName SBool -> FlaggedDep -> SBool
     checkDependency sflags (Simple d@(Dependency pn _)) =
       maybe false
             (\(SPackage _ _ v) -> v ./=0 &&& depToSConstraint vms d v)
