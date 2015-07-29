@@ -30,6 +30,8 @@ module Distribution.Client.Dependency.ExternalSMT
     installedIdtoDep
   ) where
 
+import Control.Applicative
+import Data.Functor
 
 import Distribution.Client.Dependency.Modular.Solver
   ( SolverConfig(..) )
@@ -66,6 +68,8 @@ import Data.List
 import Data.List.Split
 import Text.ParserCombinators.ReadP (readP_to_S)
 import Data.Function (on)
+import System.Directory (getHomeDirectory)
+import System.FilePath ((</>))
 
 import Data.SBV
 
@@ -242,8 +246,9 @@ solveSMT :: S.Set PackageName
          -> [[([PD.FlagName],[FlaggedDep])]]
          -> IO [ResolvedInstance]
 solveSMT targets vms pns nis pcs fdeps = do
-  model <- getModel <$> satWith cfg ( mkExistVars (length pns) >>=
-                                      validateModel targets vms pcs . mkSPkgs )
+  home  <- getHomeDirectory
+  model <- getModel <$> satWith (cfg home) ( mkExistVars (length pns) >>=
+                                             validateModel targets vms pcs . mkSPkgs )
   case model of
     Right (_, sln) -> return $ zip pns sln
     Left  m        -> return []
@@ -251,7 +256,7 @@ solveSMT targets vms pns nis pcs fdeps = do
   --return $ maybe [] (zip pns) model
   where
     mkSPkgs = M.fromList . zip pns . zipWith3 SPackage nis fdeps
-    cfg = z3 { smtFile = Just "/home/io/smtoutput", timing = True }
+    cfg home = z3 { smtFile = Just $ home </> "smtoutput", timing = True }
 
 
 -- | This is the entry point for the external SMT solver.
