@@ -212,18 +212,18 @@ validateModel targets vms pcs spkgs = (bAll checkPkgConstraint pcs &&&) . bAnd
     checkPkgConstraint (pn, c) = c . spkgSVersion . fromJust $ M.lookup pn spkgs
 
     checkPkg (pn, SPackage ni fdeps ver)
-      | pn `S.member` targets = (ver ./= 0 &&&) <$> validPkg ni fdeps ver
-      | otherwise             = (ver .== 0 |||) <$> validPkg ni fdeps ver
+      | pn `S.member` targets = (ver ./= 0 &&&) <$> validPkg pn ni fdeps ver
+      | otherwise             = (ver .== 0 |||) <$> validPkg pn ni fdeps ver
 
-    validPkg ni fdeps ver = (checkVersionRange ni ver &&&)
-                        <$> checkDepConstraints ver fdeps
+    validPkg pn ni fdeps ver = (checkVersionRange ni ver &&&)
+                           <$> checkDepConstraints pn ver fdeps
 
     checkVersionRange ni ver = ver .>= 0 &&& ver .<= ni
 
-    checkDepConstraints ver fdeps =
+    checkDepConstraints pn ver fdeps =
       bOr <$> mapM (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fdeps'
                                         . M.fromList . zip fns
-                                      <$> mkExistVars (length fns) )
+                                      <$> mkExistentials (map (\ f -> unPackageName pn ++ ":" ++ unFlagName f) fns) )
                    (zip [1..] fdeps)
 
     checkAllDeps fdeps sflags = bAll (checkDependency sflags) fdeps
@@ -237,6 +237,12 @@ validateModel targets vms pcs spkgs = (bAll checkPkgConstraint pcs &&&) . bAnd
           (checkAllDeps t sflags)
           (checkAllDeps f sflags)
 
+unFlagName :: PD.FlagName -> String
+unFlagName (PD.FlagName f) = f
+
+-- | Create a number of existential variables based on the given list of names.
+mkExistentials :: SymWord a => [String] -> Symbolic [SBV a]
+mkExistentials = mapM exists
 
 solveSMT :: S.Set PackageName
          -> VersionMappings
@@ -247,7 +253,7 @@ solveSMT :: S.Set PackageName
          -> IO ([ResolvedInstance], [Bool])
 solveSMT targets vms pns nis pcs fdeps = do
   home  <- getHomeDirectory
-  model <- getModel <$> satWith (cfg home) ( mkExistVars (length pns) >>=
+  model <- getModel <$> satWith (cfg home) ( mkExistentials (map unPackageName pns) >>=
                                              validateModel targets vms pcs . mkSPkgs )
   case model of
     Right (_, (sln, bs)) -> return (zip pns sln, bs)
