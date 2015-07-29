@@ -244,14 +244,14 @@ solveSMT :: S.Set PackageName
          -> [SWord32]
          -> [(PackageName,SConstraint)]
          -> [[([PD.FlagName],[FlaggedDep])]]
-         -> IO [ResolvedInstance]
+         -> IO ([ResolvedInstance], [Bool])
 solveSMT targets vms pns nis pcs fdeps = do
   home  <- getHomeDirectory
   model <- getModel <$> satWith (cfg home) ( mkExistVars (length pns) >>=
                                              validateModel targets vms pcs . mkSPkgs )
   case model of
-    Right (_, sln) -> return $ zip pns sln
-    Left  m        -> return []
+    Right (_, (sln, bs)) -> return (zip pns sln, bs)
+    Left  m              -> return ([], [])
   --model <- maximize Quantified sum (length pns) (valid targets . mkSPkgs)
   --return $ maybe [] (zip pns) model
   where
@@ -272,7 +272,7 @@ solveSMT targets vms pns nis pcs fdeps = do
 --
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
-  sln <- solveSMT (S.fromList pns) vms candidatePackages nis pcs' fdeps
+  (sln, _) <- solveSMT (S.fromList pns) vms candidatePackages nis pcs' fdeps
   let sln' = toPackageIds vms sln
   print $ map prettyPackageId sln'
   return $ Fail "not fully implemented yet"
