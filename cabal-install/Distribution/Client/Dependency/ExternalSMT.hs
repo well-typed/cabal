@@ -40,9 +40,11 @@ import Distribution.Client.Dependency.Types
 import Distribution.System
   ( Platform(..) )
 import Distribution.Client.Types
-  ( SourcePackage(..) )
+  ( SourcePackage(..), InstalledPackage(..) )
 import qualified Distribution.PackageDescription as PD
 import qualified Distribution.Simple.PackageIndex as PI
+import Distribution.Client.InstallPlan
+  ( PlanPackage(..) )
 import Distribution.InstalledPackageInfo
   ( InstalledPackageInfo_(..) )
 import Distribution.Package
@@ -90,7 +92,8 @@ type SDepConstraints = M.Map PackageName [SConstraint]
 data SPackage = SPackage {
   spkgNumInstances    :: SWord32,
   spkgFDeps           :: [([PD.FlagName],[FlaggedDep])],
-  spkgSVersion        :: SVersion
+  spkgSVersion        :: SVersion,
+  spkgsSFlags         :: [SBool]
 }
 
 
@@ -181,8 +184,8 @@ depToSConstraint vms (Dependency pn vr) = mkConstraint vr
          then const false
          else \s -> s .>= head vs &&& s .<= last vs
 
-    -- TODO: fix fromJust
-    (vts, _) = fromJust $ M.lookup pn vms
+    (vts, _) = fromMaybe (error "ExternalSMT.depToSConstraint: version maps lookup failed")
+             $ M.lookup pn vms
 
 
 pkgConstraintToSConstraint :: VersionMappings -> PackageConstraint -> SConstraint
@@ -205,44 +208,45 @@ validateModel :: S.Set PackageName
               -> VersionMappings
               -> [(PackageName,SConstraint)]
               -> M.Map PackageName SPackage
-              -> Symbolic SBool
-validateModel targets vms pcs spkgs = (bAll checkPkgConstraint pcs &&&) . bAnd
-                                  <$> mapM checkPkg (M.toList spkgs)
+              -> SBool
+validateModel targets vms pcs spkgs = bAll checkPkgConstraint pcs
+                                  &&& bAll checkPkg (M.toList spkgs)
   where
     checkPkgConstraint :: (PackageName, SConstraint) -> SBool
-    checkPkgConstraint (pn, c) = c . spkgSVersion . fromJust $ M.lookup pn spkgs
+    checkPkgConstraint (pn, c) = c . spkgSVersion
+                               . fromMaybe (error "ExternalSMT.validateModel: lookup failed in checkPkgConstraint")
+                               $ M.lookup pn spkgs
 
-    checkPkg :: (PackageName, SPackage) -> Symbolic SBool
-    checkPkg (pn, SPackage ni fdeps ver)
-      | pn `S.member` targets = (ver ./= 0 &&&) <$> validPkg pn ni fdeps ver
-      | otherwise             = (ver .== 0 |||) <$> validPkg pn ni fdeps ver
+    checkPkg :: (PackageName, SPackage) -> SBool
+    checkPkg (pn, spkg@(SPackage _ _ ver _))
+      | pn `S.member` targets = ver ./= 0 &&& validPkg pn spkg
+      | otherwise             = ver .== 0 ||| validPkg pn spkg
 
-    validPkg :: PackageName -> SWord32 -> [([PD.FlagName], [FlaggedDep])] -> SVersion -> Symbolic SBool
-    validPkg pn ni fdeps ver = (checkVersionRange ni ver &&&)
-                           <$> checkDepConstraints pn ver fdeps
+    validPkg :: PackageName -> SPackage -> SBool
+    validPkg pn (SPackage ni fdeps ver sflags) =
+      checkVersionRange ni ver &&& checkDepConstraints pn ver fdeps sflags
 
     checkVersionRange :: SWord32 -> SVersion -> SBool
     checkVersionRange ni ver = ver .>= 0 &&& ver .<= ni
 
-    checkDepConstraints :: PackageName -> SVersion -> [([PD.FlagName], [FlaggedDep])] -> Symbolic SBool
-    checkDepConstraints pn ver fdeps =
-      bOr <$> mapM (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fdeps'
-                                        . M.fromList . zip fns
-                                      <$> mkExistentials (map (\ f -> unPackageName pn ++ ":" ++ unFlagName f) fns) )
-                   (zip [1..] fdeps)
+    checkDepConstraints :: PackageName -> SVersion -> [([PD.FlagName], [FlaggedDep])] -> [SBool] -> SBool
+    checkDepConstraints pn ver fdeps sflags =
+      bAny (\(v, (fns,fdeps')) -> (v .== ver &&&) . checkAllDeps fdeps'
+                                . M.fromList $ zip fns sflags )
+           (zip [1..] fdeps)
 
     checkAllDeps :: [FlaggedDep] -> M.Map PD.FlagName SBool -> SBool
     checkAllDeps fdeps sflags = bAll (checkDependency sflags) fdeps
 
     checkDependency :: M.Map PD.FlagName SBool -> FlaggedDep -> SBool
-    checkDependency sflags (Simple d@(Dependency pn _)) =
+    checkDependency _ (Simple d@(Dependency pn _)) =
       maybe false
-            (\(SPackage _ _ v) -> v ./=0 &&& depToSConstraint vms d v)
+            (\(SPackage _ _ v _) -> v ./= 0 &&& depToSConstraint vms d v)
             (M.lookup pn spkgs)
     checkDependency sflags (Flagged fn t f) =
-      ite (fromJust $ M.lookup fn sflags)
-          (checkAllDeps t sflags)
-          (checkAllDeps f sflags)
+      ite ( fromMaybe (error "ExternalSMT.validateModel: lookup failed in checkDependency")
+            $ M.lookup fn sflags )
+          (checkAllDeps t sflags) (checkAllDeps f sflags)
 
 unFlagName :: PD.FlagName -> String
 unFlagName (PD.FlagName f) = f
@@ -251,25 +255,49 @@ unFlagName (PD.FlagName f) = f
 mkExistentials :: SymWord a => [String] -> Symbolic [SBV a]
 mkExistentials = mapM exists
 
+
 solveSMT :: S.Set PackageName
          -> VersionMappings
          -> [PackageName]
          -> [SWord32]
          -> [(PackageName,SConstraint)]
          -> [[([PD.FlagName],[FlaggedDep])]]
-         -> IO ([ResolvedInstance], [Bool])
+         -> IO ([ResolvedInstance], [[Bool]])
 solveSMT targets vms pns nis pcs fdeps = do
   home  <- getHomeDirectory
-  model <- getModel <$> satWith (cfg home) ( mkExistentials (map unPackageName pns) >>=
-                                             validateModel targets vms pcs . mkSPkgs )
+  model <- getModel <$> satWith (cfg home) symbolicModel
   case model of
-    Right (_, (sln, bs)) -> return (zip pns sln, bs)
+    Right (_, (sln, bs)) -> return (zip pns sln, groupByCounts flagCounts bs)
     Left  m              -> return ([], [])
   --model <- maximize Quantified sum (length pns) (valid targets . mkSPkgs)
   --return $ maybe [] (zip pns) model
   where
-    mkSPkgs = M.fromList . zip pns . zipWith3 SPackage nis fdeps
+    mkSPkgs :: [SVersion] -> [[SBool]] -> M.Map PackageName SPackage
+    mkSPkgs svers sflags = M.fromList . zip pns
+                         $ zipWith4 SPackage nis fdeps svers sflags
+
     cfg home = z3 { smtFile = Just $ home </> "smtoutput", timing = True }
+
+    maxFlags :: [([PD.FlagName],[FlaggedDep])] -> Int
+    maxFlags fdeps'
+      | null fdeps' = 0
+      | otherwise   = maximum $ map (length . fst) fdeps'
+
+    flagCounts :: [Int]
+    flagCounts = map maxFlags fdeps
+
+    groupByCounts :: [Int] -> [a] -> [[a]]
+    groupByCounts [] _ = []
+    groupByCounts _ [] = []
+    groupByCounts (n:ns) as = let (as', rest) = splitAt n as in
+                              as' : groupByCounts ns rest
+
+    symbolicModel :: Symbolic SBool
+    symbolicModel = do
+      svers  <- mkExistentials (map unPackageName pns)
+      sflags <- mapM mkExistVars flagCounts
+      return $ validateModel targets vms pcs (mkSPkgs svers sflags)
+
 
 
 -- | This is the entry point for the external SMT solver.
@@ -318,6 +346,8 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
                     (PI.lookupPackageName iidx pn)
         sourceInstances = map (SI . packageVersion) (lookupPackageName sidx pn)
 
+    -- TODO: handle installed dependencies correctly. Requires more than just
+    --       converting them to Dependency (create intermediate data type?)
     buildDeps :: PackageName -> [([PD.FlagName],[FlaggedDep])]
     buildDeps pn = map snd . sortBy (compare `on` fst)
                  $ sourceDeps ++ installedDeps
@@ -345,6 +375,21 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
         childdeps = concatMap (concatMap fdepnames . snd) (buildDeps x)
         fdepnames (Simple (Dependency pn _)) = [pn]
         fdepnames (Flagged _ t f           ) = concatMap fdepnames (t ++ f)
+
+
+mkInstallPlan :: PI.InstalledPackageIndex -> PI.PackageIndex SourcePackage
+              -> [ResolvedInstance] -> [[Bool]] -> VersionMappings -> [PlanPackage]
+mkInstallPlan iidx sidx ris flagVals vms = catMaybes
+                                         $ zipWith mkPlanPackage ris flagVals
+  where
+    mkPlanPackage (pn, v) flagVals' = do
+      (_,stv)   <- M.lookup pn vms
+      pInstance <- M.lookup v stv
+      case pInstance of
+        II ver instId -> do p <- PI.lookupInstalledPackageId iidx instId
+                            return $ PreExisting (InstalledPackage p [])
+        SI ver        -> do p <- PI.lookupPackageId sidx (PackageIdentifier pn ver)
+                            return undefined -- TODO: finish
 
 
 toPackageIds :: VersionMappings -> [ResolvedInstance] -> [PackageIdentifier]
