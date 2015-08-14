@@ -43,8 +43,9 @@ import Distribution.Client.Types
   ( SourcePackage(..), InstalledPackage(..) )
 import qualified Distribution.PackageDescription as PD
 import qualified Distribution.Simple.PackageIndex as PI
+import qualified Distribution.Client.ComponentDeps as CD
 import Distribution.Client.InstallPlan
-  ( PlanPackage(..) )
+  ( PlanPackage(..), ConfiguredPackage(..) )
 import Distribution.InstalledPackageInfo
   ( InstalledPackageInfo_(..) )
 import Distribution.Package
@@ -54,7 +55,9 @@ import Distribution.Package
     InstalledPackageId(..),
     packageVersion )
 import Distribution.Client.PackageIndex
-  ( lookupPackageName )
+  ( PackageIndex,
+    lookupPackageName,
+    lookupPackageId )
 import Distribution.System (OS, Arch)
 import Distribution.Compiler
   ( CompilerInfo(..),
@@ -262,13 +265,13 @@ solveSMT :: S.Set PackageName
          -> [SWord32]
          -> [(PackageName,SConstraint)]
          -> [[([PD.FlagName],[FlaggedDep])]]
-         -> IO ([ResolvedInstance], [[Bool]])
+         -> IO (Maybe ([ResolvedInstance], [[Bool]]) )
 solveSMT targets vms pns nis pcs fdeps = do
   home  <- getHomeDirectory
   model <- getModel <$> satWith (cfg home) symbolicModel
   case model of
-    Right (_, (sln, bs)) -> return (zip pns sln, groupByCounts flagCounts bs)
-    Left  m              -> return ([], [])
+    Right (_, (sln, bs)) -> return $ Just (zip pns sln, groupByCounts flagCounts bs)
+    Left  m              -> return Nothing
   --model <- maximize Quantified sum (length pns) (valid targets . mkSPkgs)
   --return $ maybe [] (zip pns) model
   where
@@ -313,10 +316,10 @@ solveSMT targets vms pns nis pcs fdeps = do
 --
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
-  (sln, _) <- solveSMT (S.fromList pns) vms candidatePackages nis pcs' fdeps
-  let sln' = toPackageIds vms sln
-  print $ map prettyPackageId sln'
-  return $ Fail "not fully implemented yet"
+  sln <- solveSMT (S.fromList pns) vms candidatePackages nis pcs' fdeps
+  case sln of
+    Just (sln', flags) -> return $ Done (mkInstallPlan iidx sidx sln' flags vms)
+    Nothing            -> return $ Fail "could not satisfy dependencies"
   where
     nis :: [SWord32]
     nis = map (fromIntegral . M.size . fst) (M.elems vms)
@@ -377,8 +380,12 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
         fdepnames (Flagged _ t f           ) = concatMap fdepnames (t ++ f)
 
 
-mkInstallPlan :: PI.InstalledPackageIndex -> PI.PackageIndex SourcePackage
-              -> [ResolvedInstance] -> [[Bool]] -> VersionMappings -> [PlanPackage]
+mkInstallPlan :: PI.InstalledPackageIndex
+              -> PackageIndex SourcePackage
+              -> [ResolvedInstance]
+              -> [[Bool]]
+              -> VersionMappings
+              -> [PlanPackage]
 mkInstallPlan iidx sidx ris flagVals vms = catMaybes
                                          $ zipWith mkPlanPackage ris flagVals
   where
@@ -388,8 +395,13 @@ mkInstallPlan iidx sidx ris flagVals vms = catMaybes
       case pInstance of
         II ver instId -> do p <- PI.lookupInstalledPackageId iidx instId
                             return $ PreExisting (InstalledPackage p [])
-        SI ver        -> do p <- PI.lookupPackageId sidx (PackageIdentifier pn ver)
-                            return undefined -- TODO: finish
+        SI ver        -> do p <- lookupPackageId sidx (PackageIdentifier pn ver)
+                            return $ Configured $ ConfiguredPackage
+                              p 
+                              (zip (map PD.flagName . PD.genPackageFlags
+                                    . packageDescription $ p) flagVals')
+                              []
+                              (CD.fromList [])
 
 
 toPackageIds :: VersionMappings -> [ResolvedInstance] -> [PackageIdentifier]
