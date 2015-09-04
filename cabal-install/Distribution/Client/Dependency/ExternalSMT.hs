@@ -12,6 +12,7 @@ module Distribution.Client.Dependency.ExternalSMT
 
     InstanceVersion,
     getVersion,
+    getInstalledId,
     isSourceInstance,
     isInstalledInstance,
 
@@ -21,11 +22,15 @@ module Distribution.Client.Dependency.ExternalSMT
     depToSConstraint,
     pkgConstraintToSConstraint,
 
+    validateModel,
+    solveSMT,
     externalSMTResolver,
+    mkInstallPlan,
 
+    convConfId,
+    compDepPNs,
     toPackageIds,
     prettyPackageId,
-
     constraintPkgName,
     installedIdtoDep
   ) where
@@ -40,7 +45,10 @@ import Distribution.Client.Dependency.Types
 import Distribution.System
   ( Platform(..) )
 import Distribution.Client.Types
-  ( SourcePackage(..), InstalledPackage(..) )
+  ( SourcePackage(..),
+    InstalledPackage(..),
+    ConfiguredId(..),
+    fakeInstalledPackageId )
 import qualified Distribution.PackageDescription as PD
 import qualified Distribution.Simple.PackageIndex as PI
 import qualified Distribution.Client.ComponentDeps as CD
@@ -55,19 +63,17 @@ import Distribution.Package
     InstalledPackageId(..),
     packageVersion )
 import Distribution.Client.PackageIndex
-  ( PackageIndex,
-    lookupPackageName,
-    lookupPackageId )
+  ( PackageIndex, lookupPackageName, lookupPackageId )
 import Distribution.System (OS, Arch)
 import Distribution.Compiler
-  ( CompilerInfo(..),
-    CompilerId(..) )
+  ( CompilerInfo(..), CompilerId(..) )
 import Distribution.Version
 
 import Data.Version ( parseVersion )
 
 import qualified Data.Map as M
 import qualified Data.Set as S
+import Control.Monad
 import Data.Maybe
 import Data.List
 import Data.List.Split
@@ -129,6 +135,10 @@ getVersion :: InstanceVersion -> Version
 getVersion (SI v  ) = v
 getVersion (II v _) = v
 
+getInstalledId :: InstanceVersion -> Maybe InstalledPackageId
+getInstalledId (II _ instId) = Just instId
+getInstalledId _             = Nothing
+
 isSourceInstance :: InstanceVersion -> Bool
 isSourceInstance (SI _) = True
 isSourceInstance _      = False
@@ -137,10 +147,13 @@ isInstalledInstance :: InstanceVersion -> Bool
 isInstalledInstance (II _ _) = True
 isInstalledInstance _        = False
 
-
 data FlaggedDep = Simple Dependency
                 | Flagged PD.FlagName [FlaggedDep] [FlaggedDep]
                 deriving (Eq, Show)
+
+isSimpleDep :: FlaggedDep -> Bool
+isSimpleDep (Simple _) = True
+isSimpleDep _          = False
 
 flaggedDeps :: OS
             -> Arch
@@ -309,16 +322,13 @@ solveSMT targets vms pns nis pcs fdeps = do
 -- What we do here is to pre-analyze the data we have available and turn
 -- it into the format that is needed so that we can the SMT solver.
 --
--- TODO: - flags, stanzas, etc
---
--- TODO: reverse translate the output of the SMT solver into what is
--- actually expected by the rest of cabal-install.
+-- TODO: stanzas
 --
 externalSMTResolver :: SolverConfig -> DependencyResolver
 externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
   sln <- solveSMT (S.fromList pns) vms candidatePackages nis pcs' fdeps
   case sln of
-    Just (sln', flags) -> return $ Done (mkInstallPlan iidx sidx sln' flags vms)
+    Just (sln', flags) -> return $ Done (mkInstallPlan iidx sidx sln' flags vms fdepMap)
     Nothing            -> return $ Fail "could not satisfy dependencies"
   where
     nis :: [SWord32]
@@ -329,6 +339,13 @@ externalSMTResolver sc (Platform arch os) cinfo iidx sidx pprefs pcs pns = do
 
     fdeps :: [[([PD.FlagName],[FlaggedDep])]]
     fdeps = map buildDeps candidatePackages
+
+    fdepMap :: M.Map PackageIdentifier [FlaggedDep]
+    fdepMap = M.fromList $ concat
+            $ zipWith (\fdeps' pn -> zip (map (\v -> PackageIdentifier pn (getVersion v)) (pkgInstances pn))
+                                         (map snd fdeps') )
+                      fdeps
+                      candidatePackages
 
     vms :: VersionMappings
     vms = M.fromList
@@ -385,23 +402,70 @@ mkInstallPlan :: PI.InstalledPackageIndex
               -> [ResolvedInstance]
               -> [[Bool]]
               -> VersionMappings
+              -> M.Map PackageIdentifier [FlaggedDep]
               -> [PlanPackage]
-mkInstallPlan iidx sidx ris flagVals vms = catMaybes
-                                         $ zipWith mkPlanPackage ris flagVals
+mkInstallPlan iidx sidx ris flagVals vms fdepMap =
+  catMaybes $ zipWith (\mi fvs -> join $ mkPlanPackage <$> mi <*> (pure fvs))
+                      maybeInstances
+                      flagVals
   where
-    mkPlanPackage (pn, v) flagVals' = do
+    pkgInstances :: [(PackageName,InstanceVersion)]
+    pkgInstances = catMaybes maybeInstances
+
+    maybeInstances :: [Maybe (PackageName,InstanceVersion)]
+    maybeInstances = map lookupPkgInstance ris
+
+    lookupPkgInstance :: ResolvedInstance -> Maybe (PackageName,InstanceVersion)
+    lookupPkgInstance (pn, v) = do
       (_,stv)   <- M.lookup pn vms
       pInstance <- M.lookup v stv
-      case pInstance of
-        II ver instId -> do p <- PI.lookupInstalledPackageId iidx instId
-                            return $ PreExisting (InstalledPackage p [])
-        SI ver        -> do p <- lookupPackageId sidx (PackageIdentifier pn ver)
-                            return $ Configured $ ConfiguredPackage
-                              p 
-                              (zip (map PD.flagName . PD.genPackageFlags
-                                    . packageDescription $ p) flagVals')
-                              []
-                              (CD.fromList [])
+      return (pn, pInstance)
+
+    mkPlanPackage :: (PackageName, InstanceVersion) -> [Bool] -> Maybe PlanPackage
+    mkPlanPackage (pn, (II ver instId)) flagVals' = do
+      p <- PI.lookupInstalledPackageId iidx instId
+      return $ PreExisting $ InstalledPackage p []
+    mkPlanPackage (pn, (SI ver)) flagVals' = do
+      p     <- lookupPackageId sidx pkgId
+      fdeps <- M.lookup pkgId fdepMap
+      let flagAssignment = zip ( map PD.flagName . PD.genPackageFlags
+                               . packageDescription $ p)
+                               flagVals'
+      return $ Configured $ ConfiguredPackage
+        p 
+        flagAssignment
+        []
+        (CD.fromList . zip (repeat CD.ComponentLib)
+                     . pure
+                     . mapMaybe (\pn' -> convConfId pn' <$> lookup pn' pkgInstances)
+                     $ compDepPNs fdeps flagAssignment )
+
+      where pkgId = PackageIdentifier pn ver
+
+
+-- Given flagged dependencies and a flag assignment,
+-- extract dependency package names.
+-- required for component deps in the install plan
+compDepPNs :: [FlaggedDep] -> PD.FlagAssignment -> [PackageName]
+compDepPNs fdeps fa = concatMap getPNs fdeps
+  where
+    getPNs (Simple (Dependency pn _)) = [pn]
+    getPNs (Flagged fn t f)
+      | fromMaybe (error "malformed flag assignment") (lookup fn fa) = compDepPNs t fa
+      | otherwise               = compDepPNs f fa
+
+
+simpleDepPNs :: [FlaggedDep] -> [PackageName]
+simpleDepPNs = mapMaybe getPN
+  where getPN (Simple (Dependency pn _)) = Just pn
+        getPN _                          = Nothing
+
+
+convConfId :: PackageName -> InstanceVersion -> ConfiguredId
+convConfId pn ver = ConfiguredId sourceId installedId
+  where sourceId    = PackageIdentifier pn (getVersion ver)
+        installedId = fromMaybe (fakeInstalledPackageId sourceId)
+                                (getInstalledId ver)
 
 
 toPackageIds :: VersionMappings -> [ResolvedInstance] -> [PackageIdentifier]
